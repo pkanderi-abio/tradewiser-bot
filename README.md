@@ -1,52 +1,239 @@
-# TradeWiser Bot
+# TradeWiser Bot 🤖📈
 
-TradeWiser is a lightweight FastAPI trading bot scaffold that integrates with **Alpaca** (much more reliable than Webull). It includes a background quote polling loop, quote endpoints, order execution support, and trade audit logging.
+**Automated Trading Bot with Momentum Strategy**
 
-## Features
+TradeWiser is a production-ready automated trading bot that uses momentum-based strategies to trade stocks and options through the Alpaca API. Features include real-time market monitoring, automatic trade execution, comprehensive audit logging, and Windows MSI packaging for enterprise deployment.
 
-- FastAPI HTTP API with health, quote, and trade routes
-- **Alpaca** trading integration with paper trading support
-- Alpaca quote retrieval with yfinance fallback
-- Background trading loop on FastAPI startup
-- Order placement endpoint with dry-run validation
-- Current order and order history endpoints
-- Trade audit logging with `GET /trades/audit` and `GET /trades/audit/{id}`
+## ✨ Features
 
-## Project Structure
+### Core Trading Features
+- **Momentum Strategy**: Automated buying/selling based on configurable price momentum thresholds
+- **Multi-Asset Support**: Stocks and options trading with real-time quotes
+- **Alpaca Integration**: Live and paper trading support with reliable API connectivity
+- **Background Processing**: Asynchronous trading loop that runs 24/7
+- **Risk Management**: Configurable thresholds and position limits
 
-- `app/main.py` — FastAPI application entry point
-- `app/core/config.py` — application settings and `.env` loading
-- `app/core/logger.py` — logging configuration
-- `app/services/webull_client.py` — Alpaca API wrapper (legacy filename, now uses Alpaca)
-- `app/services/trading_engine.py` — polling loop and order strategy placeholder
-- `app/routes/` — REST endpoints for health, quotes, and trades
-- `app/services/utils.py` — trade audit log storage utilities
+### API & Monitoring
+- **REST API**: FastAPI-based endpoints for health checks, strategy status, and manual trading
+- **Real-time Monitoring**: Live strategy status with momentum calculations
+- **Audit Logging**: Complete trade history with timestamps and execution details
+- **Health Checks**: System monitoring and connectivity validation
 
-## Requirements
+### Production Deployment
+- **Windows MSI Packaging**: Enterprise-ready installer for Windows Server
+- **Windows Service**: Auto-start service with proper permissions
+- **Production Configuration**: Environment-based settings for live trading
+- **Deployment Automation**: PowerShell scripts for streamlined server deployment
 
-- Python 3.11+ recommended
-- `alpaca-py` package for brokerage integration
-- `yfinance` package for quote data fallback
+## 🚀 Quick Start (Development)
 
-## Installation
+### Prerequisites
+- Python 3.8+
+- Alpaca account ([Free Paper Trading](https://alpaca.markets/))
 
+### Installation
 ```bash
-cd tradewiser_bot
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+# Clone the repository
+git clone https://github.com/YOUR_USERNAME/tradewiser-bot.git
+cd tradewiser-bot/tradewiser_bot
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-## Configuration
+### Configuration
+```bash
+# Copy sample configuration
+cp sample.env .env
 
-### Get Alpaca API Keys (FREE)
+# Edit .env with your Alpaca credentials
+# ALPACA_API_KEY=your_api_key_here
+# ALPACA_SECRET_KEY=your_secret_key_here
+# ALPACA_BASE_URL=https://paper-api.alpaca.markets  # Paper trading
+```
 
-1. Go to [https://alpaca.markets/](https://alpaca.markets/) and create a free account
-2. Navigate to your dashboard and generate API keys
-3. Choose "Paper Trading" for risk-free testing (unlimited virtual money)
+### Run the Bot
+```bash
+# Start the trading bot
+python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-Create a `.env` file in the project root with the following values:
+# API will be available at: http://localhost:8000
+```
+
+### Test the API
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Strategy status (shows momentum for all monitored symbols)
+curl http://localhost:8000/trades/strategy/status
+
+# View trade audit log
+curl http://localhost:8000/trades/audit
+```
+
+## 🏗️ Production Deployment (Windows Server)
+
+### Build MSI Package
+```cmd
+# On Windows machine with Python + WiX Toolset
+cd tradewiser_bot
+build_msi.bat
+```
+
+### Deploy to Windows Server
+```powershell
+# Install MSI
+msiexec /i tradewiser.msi
+
+# Configure with production credentials
+.\deploy.ps1 -AlpacaApiKey "YOUR_LIVE_API_KEY" -AlpacaSecretKey "YOUR_LIVE_SECRET" -UseLiveTrading
+```
+
+See [README_Windows_Deployment.md](README_Windows_Deployment.md) for detailed deployment instructions.
+
+## 📊 Trading Strategy
+
+### Momentum Algorithm
+- **Monitors**: 9 symbols (3 stocks + 6 options contracts)
+- **Buy Threshold**: +0.2% price momentum
+- **Sell Threshold**: -0.2% price momentum
+- **Window**: 5-period moving average
+- **Poll Interval**: 5 seconds
+
+### Monitored Symbols
+**Stocks**: SPY, QQQ, AAPL
+**Options**: Near-the-money calls and puts for each stock
+
+### Auto-Trading Flow
+1. Collect 5 price points over 25 seconds
+2. Calculate momentum percentage change
+3. Execute buy/sell orders when thresholds crossed
+4. Log all trades to audit trail
+
+## 🔧 API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Service health check |
+| GET | `/trades/strategy/status` | Real-time strategy status |
+| GET | `/trades/audit` | Complete trade history |
+| POST | `/trades/execute` | Manual trade execution |
+| GET | `/quotes/{symbol}` | Get current quote |
+
+### Strategy Status Response
+```json
+{
+  "status": "ok",
+  "strategy": "momentum",
+  "parameters": {
+    "window": 5,
+    "buy_threshold": 0.002,
+    "sell_threshold": -0.002,
+    "trade_quantity": 1
+  },
+  "momentum_data": {
+    "SPY": {
+      "current_price": 510.25,
+      "momentum": 0.0015,
+      "momentum_percent": "0.15%",
+      "should_buy": false,
+      "should_sell": false
+    }
+  }
+}
+```
+
+## 🏛️ Project Structure
+
+```
+tradewiser_bot/
+├── app/
+│   ├── main.py                 # FastAPI application
+│   ├── core/
+│   │   ├── config.py          # Environment configuration
+│   │   ├── logger.py          # Logging setup
+│   │   └── scheduler.py       # Background task management
+│   ├── routes/
+│   │   ├── health.py          # Health check endpoints
+│   │   ├── quotes.py          # Quote retrieval
+│   │   └── trades.py          # Trading endpoints
+│   └── services/
+│       ├── trading_engine.py  # Momentum strategy logic
+│       ├── webull_client.py   # Alpaca API client
+│       └── utils.py           # Audit logging utilities
+├── build_msi.bat              # Windows MSI build script
+├── deploy.ps1                 # Production deployment script
+├── tradewiser.wxs             # WiX installer configuration
+├── windows_service.py         # Windows service wrapper
+├── requirements.txt           # Python dependencies
+├── sample.env                # Configuration template
+└── README_Windows_Deployment.md # Detailed deployment guide
+```
+
+## ⚙️ Configuration
+
+### Environment Variables
+```env
+# Alpaca API Credentials
+ALPACA_API_KEY=your_api_key
+ALPACA_SECRET_KEY=your_secret_key
+ALPACA_BASE_URL=https://api.alpaca.markets  # Live trading
+
+# Trading Parameters
+POLL_INTERVAL=5  # Seconds between checks
+
+# Legacy (not used)
+WEBULL_EMAIL=
+WEBULL_PASSWORD=
+WEBULL_DEVICE_NAME=TradeWiserBot
+```
+
+### Alpaca Account Setup
+1. Visit [alpaca.markets](https://alpaca.markets/)
+2. Create free account
+3. Generate API keys in dashboard
+4. Start with paper trading for testing
+
+## 🔒 Security & Best Practices
+
+- **Paper Trading First**: Always test with paper trading before live deployment
+- **Secure Credentials**: Store API keys securely, never commit to version control
+- **Risk Management**: Set appropriate position sizes and stop losses
+- **Monitoring**: Regularly check trade audit logs and system health
+- **Updates**: Keep dependencies updated and monitor Alpaca API changes
+
+## 📈 Performance & Reliability
+
+- **High-Frequency Monitoring**: 5-second poll intervals for responsive trading
+- **Error Handling**: Comprehensive error handling with fallbacks
+- **Connection Resilience**: Automatic reconnection and retry logic
+- **Audit Trail**: Complete logging of all trading activities
+- **Health Monitoring**: Built-in health checks for system status
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## ⚠️ Disclaimer
+
+This software is for educational and informational purposes only. Trading involves substantial risk of loss and is not suitable for every investor. Past performance does not guarantee future results. Please consult with a qualified financial advisor before making investment decisions.
+
+---
+
+**Built with ❤️ for automated trading**
 
 ```env
 # Alpaca API credentials (recommended - much more reliable than Webull)
