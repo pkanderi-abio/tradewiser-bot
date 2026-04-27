@@ -38,8 +38,22 @@ pyinstaller --clean --onefile --name windows_service windows_service.py
 REM Check if WiX Toolset is installed
 where candle >nul 2>nul
 if %errorlevel% neq 0 (
-    echo ERROR: WiX Toolset not found. Please install WiX Toolset from:
-    echo https://wixtoolset.org/releases/
+    echo.
+    echo ERROR: WiX Toolset not found!
+    echo.
+    echo Please install WiX Toolset from one of these sources:
+    echo.
+    echo OPTION 1: Download executable installer
+    echo   URL: https://github.com/wixtoolset/wix/releases
+    echo   Download: wix-X.X.X-x64.exe
+    echo   Then run the installer
+    echo.
+    echo OPTION 2: Use Windows Package Manager
+    echo   Command: winget install --id WiXToolset.WiXToolset
+    echo.
+    echo OPTION 3: Install via Visual Studio
+    echo   Add "Windows development" workload to VS installer
+    echo.
     pause
     exit /b 1
 )
