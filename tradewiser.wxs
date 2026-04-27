@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="TradeWiser Bot" Language="1033" Version="1.0.0.0"
+           Manufacturer="TradeWiser" UpgradeCode="12345678-1234-1234-1234-123456789012">
+
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate />
+
+    <Feature Id="ProductFeature" Title="TradeWiserBot" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <UIRef Id="WixUI_InstallDir" />
+
+    <!-- Define directories -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="TradeWiserFolder" Name="TradeWiser">
+          <Directory Id="INSTALLFOLDER" Name="TradeWiser Bot" />
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="TradeWiser" />
+      </Directory>
+    </Directory>
+
+    <!-- Components -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <!-- Main executable -->
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="TradeWiserBot.exe" Source="dist\tradewiser-bot.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- Service executable -->
+      <Component Id="ServiceExecutable" Guid="*">
+        <File Id="TradeWiserService.exe" Source="dist\windows_service.exe" />
+      </Component>
+
+      <!-- Config files -->
+      <Component Id="ConfigFiles" Guid="*">
+        <File Id="ConfigPy" Source="app\core\config.py" />
+        <File Id="LoggerPy" Source="app\core\logger.py" />
+      </Component>
+
+      <!-- Route files -->
+      <Component Id="RouteFiles" Guid="*">
+        <File Id="QuotesPy" Source="app\routes\quotes.py" />
+        <File Id="TradesPy" Source="app\routes\trades.py" />
+        <File Id="HealthPy" Source="app\routes\health.py" />
+      </Component>
+
+      <!-- Service files -->
+      <Component Id="ServiceFiles" Guid="*">
+        <File Id="TradingEnginePy" Source="app\services\trading_engine.py" />
+        <File Id="WebullClientPy" Source="app\services\webull_client.py" />
+        <File Id="UtilsPy" Source="app\services\utils.py" />
+      </Component>
+
+      <!-- Main files -->
+      <Component Id="MainFiles" Guid="*">
+        <File Id="MainPy" Source="app\main.py" />
+        <File Id="RequirementsTxt" Source="requirements.txt" />
+      </Component>
+
+      <!-- Sample .env file -->
+      <Component Id="SampleEnv" Guid="*">
+        <File Id="SampleEnvFile" Source="sample.env" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Start Menu Shortcut -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcut" Guid="*">
+        <Shortcut Id="ApplicationStartMenuShortcut"
+                  Name="TradeWiser Bot"
+                  Description="Automated Trading Bot"
+                  Target="[INSTALLFOLDER]TradeWiserBot.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\TradeWiser\TradeWiserBot" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Custom actions for service installation -->
+    <CustomAction Id="InstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; TradeWiserService.exe install"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="StartService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; TradeWiserService.exe start"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="StopService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; TradeWiserService.exe stop"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <CustomAction Id="UninstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; TradeWiserService.exe remove"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Install sequence -->
+    <InstallExecuteSequence>
+      <Custom Action="InstallService" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="StartService" After="InstallService">NOT Installed</Custom>
+      <Custom Action="StopService" Before="RemoveFiles">Installed</Custom>
+      <Custom Action="UninstallService" After="StopService">Installed</Custom>
+    </InstallExecuteSequence>
+
+  </Product>
+</Wix>
