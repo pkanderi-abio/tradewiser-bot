@@ -58,7 +58,7 @@ if not exist "dist\windows_service.exe" (
     exit /b 1
 )
 
-REM Check for WiX Toolset - support both v3 (candle) and v4 (wix)
+REM Check for WiX Toolset - support both v3 (candle) and v4/v5 (wix)
 set WIX_VERSION=0
 where candle >nul 2>nul
 if %errorlevel% equ 0 set WIX_VERSION=3
@@ -67,8 +67,22 @@ where wix >nul 2>nul
 if %errorlevel% equ 0 set WIX_VERSION=4
 
 if %WIX_VERSION% equ 0 (
-    echo ERROR: WiX Toolset not found. Please install WiX Toolset from:
-    echo https://wixtoolset.org/releases/
+    echo.
+    echo ERROR: WiX Toolset not found!
+    echo.
+    echo Please install WiX Toolset from one of these sources:
+    echo.
+    echo OPTION 1: Download executable installer
+    echo   URL: https://github.com/wixtoolset/wix/releases
+    echo   Download: wix-X.X.X-x64.exe
+    echo   Then run the installer
+    echo.
+    echo OPTION 2: Use Windows Package Manager
+    echo   Command: winget install --id WiXToolset.WiXToolset
+    echo.
+    echo OPTION 3: Install via Visual Studio
+    echo   Add "Windows development" workload to VS installer
+    echo.
     pause
     exit /b 1
 )

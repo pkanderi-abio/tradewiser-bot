@@ -6,8 +6,34 @@ This guide covers packaging the TradeWiser trading bot as an MSI installer and d
 
 ### Build Machine Requirements
 - Windows 10/11 with Python 3.8+
-- [WiX Toolset](https://wixtoolset.org/releases/) (for MSI creation)
+- **WiX Toolset v4.0+ or v5.0+** (for MSI creation)
+  - **Download from:** https://github.com/wixtoolset/wix/releases/tag/v5.0.2 (or latest)
+  - Or use **Visual Studio Installer** (WiX is included in some VS workloads)
+  - Or download from: https://wixtoolset.org (official site)
 - PyInstaller (`pip install pyinstaller`)
+
+### Installation Steps for WiX Toolset
+
+**Option 1: Download Direct Executable (Recommended)**
+1. Visit: https://github.com/wixtoolset/wix/releases
+2. Click on latest release (e.g., "WiX Toolset v5.0.2")
+3. Scroll down to "Assets" section
+4. Download: `wix-<version>-x64.exe` (for 64-bit Windows)
+5. Run the installer and follow prompts
+6. Verify installation:
+   ```cmd
+   candle.exe -?
+   light.exe -?
+   ```
+
+**Option 2: Using Windows Package Manager**
+```cmd
+winget install --id WiXToolset.WiXToolset -e
+```
+
+**Option 3: Visual Studio Installation**
+- Install Visual Studio with "Windows development" workload
+- Includes WiX Toolset 4.0 integration
 
 ### Windows Server Requirements
 - Windows Server 2016+ or Windows 10/11 Pro
