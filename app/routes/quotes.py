@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
-from app.services.webull_client import webull_client
+from fastapi import APIRouter, Depends, HTTPException
+from app.core.auth import require_api_key
+from app.services.alpaca_client import alpaca_client
 
-router = APIRouter(prefix="/quotes", tags=["quotes"])
+router = APIRouter(prefix="/quotes", tags=["quotes"], dependencies=[Depends(require_api_key)])
 
 WATCHLIST = ["SPY", "QQQ", "AAPL"]
 
@@ -11,7 +12,7 @@ async def list_watchlist():
 
 @router.get("/{symbol}")
 async def get_quote(symbol: str):
-    quote = webull_client.get_quote(symbol.upper())
+    quote = alpaca_client.get_quote(symbol.upper())
     if not quote:
         raise HTTPException(status_code=502, detail=f"Unable to fetch quote for {symbol}")
     return {"symbol": symbol.upper(), "quote": quote}

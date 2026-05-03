@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
@@ -14,7 +14,7 @@ def record_audit_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         log_entry = {
             "id": _audit_next_id,
             **entry,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         _audit_log.append(log_entry)
         _audit_next_id += 1

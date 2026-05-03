@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="TradeWiser Bot"
+           Language="1033"
+           Version="1.0.0.0"
+           Manufacturer="TradeWiser"
+           UpgradeCode="12345678-1234-1234-1234-123456789012"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
+    <!-- Define directories -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="TradeWiserFolder" Name="TradeWiser">
+        <Directory Id="INSTALLFOLDER" Name="TradeWiser Bot" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="TradeWiser" />
+    </StandardDirectory>
+
+    <!-- Feature -->
+    <Feature Id="ProductFeature" Title="TradeWiserBot" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+    <!-- Components -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+
+      <!-- Main executable -->
+      <Component Id="MainExecutable" Guid="12345678-1234-1234-1234-123456789001">
+        <File Id="TradeWiserBot.exe" Source="dist\tradewiser-bot.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- Service executable -->
+      <Component Id="ServiceExecutable" Guid="12345678-1234-1234-1234-123456789002">
+        <File Id="TradeWiserService.exe" Source="dist\windows_service.exe" KeyPath="yes" />
+      </Component>
+
+      <!-- Sample .env file -->
+      <Component Id="SampleEnv" Guid="12345678-1234-1234-1234-123456789003">
+        <File Id="SampleEnvFile" Source="sample.env" KeyPath="yes" />
+      </Component>
+
+      <!-- Requirements.txt -->
+      <Component Id="RequirementsFile" Guid="12345678-1234-1234-1234-123456789004">
+        <File Id="RequirementsTxt" Source="requirements.txt" KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+
+    <!-- Start Menu Shortcut -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcut" Guid="12345678-1234-1234-1234-123456789005">
+        <Shortcut Id="ApplicationStartMenuShortcut"
+                  Name="TradeWiser Bot"
+                  Description="Automated Trading Bot"
+                  Target="[INSTALLFOLDER]tradewiser-bot.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\TradeWiser\TradeWiserBot"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Custom actions for service install/uninstall -->
+    <CustomAction Id="InstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; windows_service.exe install"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="StartService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; windows_service.exe start"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="StopService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; windows_service.exe stop"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <CustomAction Id="UninstallService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand='"[SystemFolder]cmd.exe" /c "cd /d [INSTALLFOLDER] &amp; windows_service.exe remove"'
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Install/uninstall sequence -->
+    <InstallExecuteSequence>
+      <Custom Action="InstallService" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="StartService" After="InstallService" Condition="NOT Installed" />
+      <Custom Action="StopService" Before="RemoveFiles" Condition="Installed" />
+      <Custom Action="UninstallService" After="StopService" Condition="Installed" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

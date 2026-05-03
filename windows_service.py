@@ -21,12 +21,14 @@ class TradeWiserService(win32serviceutil.ServiceFramework):
         win32serviceutil.ServiceFramework.__init__(self, args)
         self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
         socket.setdefaulttimeout(60)
-        self.is_alive = True
+        self.server = None
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         win32event.SetEvent(self.hWaitStop)
-        self.is_alive = False
+        # Signal uvicorn to exit — it polls this flag on every tick
+        if self.server is not None:
+            self.server.should_exit = True
 
     def SvcDoRun(self):
         servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
@@ -34,17 +36,13 @@ class TradeWiserService(win32serviceutil.ServiceFramework):
                             (self._svc_name_, ''))
 
         try:
-            # Import and start the FastAPI app
             from app.main import app
             import uvicorn
             import asyncio
 
-            # Run the server
-            config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
-            server = uvicorn.Server(config)
-
-            # Start the server in the service
-            asyncio.run(server.serve())
+            config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info")
+            self.server = uvicorn.Server(config)
+            asyncio.run(self.server.serve())
 
         except Exception as e:
             servicemanager.LogErrorMsg(f"Service failed: {str(e)}")

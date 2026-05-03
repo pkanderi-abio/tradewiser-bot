@@ -6,3 +6,4 @@ alpaca-py
 python-dotenv
 sqlalchemy
 yfinance
+openai

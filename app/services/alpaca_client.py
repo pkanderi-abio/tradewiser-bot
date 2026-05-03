@@ -1,0 +1,424 @@
+# app/services/alpaca_client.py — Alpaca Markets trading client
+
+from typing import Optional, Dict, Any
+import logging
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, OptionChainRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
+from app.core.config import settings
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+class AlpacaClient:
+    """Alpaca trading client - supports stocks and options"""
+
+    def __init__(self):
+        self.trading_client = TradingClient(
+            api_key=settings.ALPACA_API_KEY,
+            secret_key=settings.ALPACA_SECRET_KEY,
+            paper="paper" in settings.ALPACA_BASE_URL
+        )
+        self.stock_data_client = StockHistoricalDataClient(
+            api_key=settings.ALPACA_API_KEY,
+            secret_key=settings.ALPACA_SECRET_KEY
+        )
+        self.options_data_client = OptionHistoricalDataClient(
+            api_key=settings.ALPACA_API_KEY,
+            secret_key=settings.ALPACA_SECRET_KEY
+        )
+        self.authenticated = False
+        self._auth_failed = False
+        self._account_id: Optional[str] = None
+
+    def login(self) -> bool:
+        """Alpaca doesn't require explicit login - authentication is via API keys"""
+        return self._ensure_authenticated()
+
+    def _ensure_authenticated(self) -> bool:
+        if self.authenticated:
+            return True
+        if self._auth_failed:
+            return False
+
+        try:
+            account = self.trading_client.get_account()
+            if account:
+                self.authenticated = True
+                self._account_id = account.id
+                logger.info("Alpaca authentication successful.")
+                return True
+            logger.error("Alpaca authentication failed - no account info")
+            self._auth_failed = True
+            return False
+        except Exception as e:
+            logger.error(f"Alpaca authentication failed: {e}")
+            self._auth_failed = True
+            return False
+
+    def get_quote(self, symbol: str):
+        """Get quote for stock or option symbol"""
+        if not self._ensure_authenticated():
+            logger.debug("Alpaca authentication failed, using yfinance fallback for quotes")
+            return self._get_quote_fallback(symbol)
+
+        # Check if it's an options symbol (starts with 'O:')
+        if symbol.startswith('O:'):
+            return self._get_options_quote(symbol)
+        else:
+            return self._get_stock_quote(symbol)
+
+    def get_batch_quotes(self, symbols: list) -> dict:
+        """Fetch quotes for a list of symbols in as few API calls as possible.
+        Returns {symbol: quote_dict}. Options (O: prefix) and stocks are batched separately.
+        """
+        if not self._ensure_authenticated():
+            return {}
+
+        stock_syms  = [s for s in symbols if not s.startswith("O:")]
+        option_syms = [s for s in symbols if s.startswith("O:")]
+        results: dict = {}
+
+        # --- stocks: single batched call ---
+        if stock_syms:
+            try:
+                req    = StockLatestQuoteRequest(symbol_or_symbols=stock_syms)
+                quotes = self.stock_data_client.get_stock_latest_quote(req)
+                for sym in stock_syms:
+                    if sym in quotes:
+                        q = quotes[sym]
+                        results[sym] = {
+                            "symbol": sym,
+                            "pLast": q.ask_price or q.bid_price,
+                            "bid": q.bid_price,
+                            "ask": q.ask_price,
+                            "source": "alpaca",
+                            "asset_class": "stock",
+                        }
+            except Exception as e:
+                logger.error(f"Batch stock quote error: {e}")
+                # fall back individually
+                for sym in stock_syms:
+                    q = self._get_quote_fallback(sym)
+                    if q:
+                        results[sym] = q
+
+        # --- options: single batched call ---
+        if option_syms:
+            try:
+                raw_syms = [s[2:] for s in option_syms]   # strip "O:" prefix
+                req      = OptionLatestQuoteRequest(symbol_or_symbols=raw_syms)
+                quotes   = self.options_data_client.get_option_latest_quote(req)
+                for orig, raw in zip(option_syms, raw_syms):
+                    if raw in quotes:
+                        q = quotes[raw]
+                        results[orig] = {
+                            "symbol": orig,
+                            "pLast": q.ask_price or q.bid_price,
+                            "bid": q.bid_price,
+                            "ask": q.ask_price,
+                            "source": "alpaca",
+                            "asset_class": "option",
+                        }
+            except Exception as e:
+                logger.debug(f"Batch options quote error (may be outside market hours): {e}")
+
+        return results
+
+    def _get_stock_quote(self, symbol: str):
+        """Get stock quote"""
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quotes = self.stock_data_client.get_stock_latest_quote(request)
+            if quotes and symbol in quotes:
+                quote = quotes[symbol]
+                return {
+                    'symbol': symbol,
+                    'pLast': quote.ask_price or quote.bid_price,
+                    'bid': quote.bid_price,
+                    'ask': quote.ask_price,
+                    'volume': quote.ask_size + quote.bid_size if quote.ask_size and quote.bid_size else None,
+                    'source': 'alpaca',
+                    'asset_class': 'stock'
+                }
+            else:
+                logger.warning(f"Alpaca returned empty stock quote for {symbol}, using fallback")
+                return self._get_quote_fallback(symbol)
+        except Exception as e:
+            logger.error(f"Alpaca stock quote fetch error for {symbol}: {e}, using fallback")
+            return self._get_quote_fallback(symbol)
+
+    def _get_options_quote(self, symbol: str):
+        """Get options quote"""
+        try:
+            # Remove 'O:' prefix for Alpaca
+            option_symbol = symbol[2:] if symbol.startswith('O:') else symbol
+            request = OptionLatestQuoteRequest(symbol_or_symbols=option_symbol)
+            quotes = self.options_data_client.get_option_latest_quote(request)
+            if quotes and option_symbol in quotes:
+                quote = quotes[option_symbol]
+                return {
+                    'symbol': symbol,
+                    'pLast': quote.ask_price or quote.bid_price,
+                    'bid': quote.bid_price,
+                    'ask': quote.ask_price,
+                    'volume': quote.ask_size + quote.bid_size if quote.ask_size and quote.bid_size else None,
+                    'source': 'alpaca',
+                    'asset_class': 'option'
+                }
+            else:
+                logger.warning(f"Alpaca returned empty options quote for {symbol}")
+                return None
+        except Exception as e:
+            logger.error(f"Alpaca options quote fetch error for {symbol}: {e}")
+            return None
+
+    def _get_quote_fallback(self, symbol: str):
+        """Fallback to yfinance for quotes"""
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            return {
+                'symbol': symbol,
+                'pLast': info.get('currentPrice') or info.get('regularMarketPrice'),
+                'bid': info.get('bid'),
+                'ask': info.get('ask'),
+                'volume': info.get('volume'),
+                'source': 'yfinance_fallback'
+            }
+        except Exception as e:
+            logger.error(f"yfinance fallback failed for {symbol}: {e}")
+            return None
+
+    def place_order(self, symbol: str, quantity: int, side: str, order_type: str = "MKT",
+                   price: Optional[float] = None, enforce: str = "GTC",
+                   outside_regular_trading_hour: bool = False,
+                   stp_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        if not self._ensure_authenticated():
+            logger.error("Unable to place order: not authenticated.")
+            return None
+
+        try:
+            # Check if it's an options symbol
+            if symbol.startswith('O:'):
+                return self._place_options_order(symbol, quantity, side, order_type, price, enforce)
+            else:
+                return self._place_stock_order(symbol, quantity, side, order_type, price, enforce)
+
+        except Exception as e:
+            logger.error(f"Failed to place order: {e}")
+            return None
+
+    def _place_stock_order(self, symbol: str, quantity: int, side: str, order_type: str = "MKT",
+                          price: Optional[float] = None, enforce: str = "GTC") -> Optional[Dict[str, Any]]:
+        """Place stock order"""
+        alpaca_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
+        alpaca_type = OrderType.MARKET if order_type == "MKT" else OrderType.LIMIT
+        time_in_force = TimeInForce.GTC if enforce == "GTC" else TimeInForce.DAY
+
+        order_request = MarketOrderRequest(
+            symbol=symbol.upper(),
+            qty=quantity,
+            side=alpaca_side,
+            type=alpaca_type,
+            time_in_force=time_in_force
+        )
+
+        # Add limit price if specified
+        if order_type == "LMT" and price:
+            order_request.limit_price = price
+
+        order = self.trading_client.submit_order(order_request)
+        logger.info(f"Stock order placed: {order.id} for {quantity} {symbol} {side}")
+
+        return {
+            'order_id': order.id,
+            'symbol': order.symbol,
+            'quantity': order.qty,
+            'side': order.side.value,
+            'type': order.type.value,
+            'status': order.status.value,
+            'asset_class': 'stock'
+        }
+
+    def _place_options_order(self, symbol: str, quantity: int, side: str, order_type: str = "MKT",
+                            price: Optional[float] = None, enforce: str = "GTC") -> Optional[Dict[str, Any]]:
+        """Place options limit order. Alpaca does not support market orders for options."""
+        try:
+            option_symbol = symbol[2:] if symbol.startswith('O:') else symbol
+            alpaca_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
+
+            # Determine limit price: use provided price, or fetch live bid/ask
+            limit_price = price
+            if limit_price is None:
+                quote = self._get_options_quote(symbol)
+                if quote:
+                    bid = float(quote.get("bid") or 0)
+                    ask = float(quote.get("ask") or 0)
+                    last = float(quote.get("pLast") or 0)
+                    if side.upper() == "BUY":
+                        # Mid-price halves the spread cost vs buying at full ask
+                        if bid > 0 and ask > 0:
+                            limit_price = round((bid + ask) / 2, 2)
+                        else:
+                            limit_price = ask or last
+                    else:
+                        # For sells: use bid, fall back to mid or last, minimum $0.01
+                        if bid > 0 and ask > 0:
+                            limit_price = round((bid + ask) / 2, 2)
+                        else:
+                            limit_price = bid or ask or last or 0.01
+
+            if not limit_price or float(limit_price) <= 0:
+                logger.error(f"Cannot place options order for {symbol}: no valid price available")
+                return None
+
+            limit_price = max(round(float(limit_price), 2), 0.01)  # Alpaca minimum
+
+            order_request = LimitOrderRequest(
+                symbol=option_symbol,
+                qty=quantity,
+                side=alpaca_side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+            )
+
+            order = self.trading_client.submit_order(order_request)
+            logger.info(f"Options limit order: {order.id} | {quantity} {symbol} {side} @ ${limit_price}")
+
+            return {
+                'order_id': order.id,
+                'symbol': symbol,
+                'quantity': order.qty,
+                'side': order.side.value,
+                'type': order.type.value,
+                'status': order.status.value,
+                'limit_price': limit_price,
+                'asset_class': 'option'
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to place options order for {symbol}: {e}")
+            return None
+
+    def get_options_chain(self, underlying_symbol: str, expiration_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get options chain for an underlying symbol"""
+        if not self._ensure_authenticated():
+            logger.error("Unable to get options chain: not authenticated.")
+            return None
+
+        try:
+            request = OptionChainRequest(
+                underlying_symbol=underlying_symbol.upper(),
+                expiration_date=expiration_date
+            )
+            chain = self.options_data_client.get_option_chain(request)
+            return {
+                'underlying_symbol': underlying_symbol,
+                'chains': chain,
+                'source': 'alpaca'
+            }
+        except Exception as e:
+            logger.error(f"Failed to get options chain for {underlying_symbol}: {e}")
+            return None
+
+    def get_account_pnl(self):
+        """Return account-level P&L summary from Alpaca."""
+        if not self._ensure_authenticated():
+            return None
+        try:
+            acct = self.trading_client.get_account()
+
+            def _f(val, default=0.0):
+                return float(val) if val is not None else default
+
+            equity      = _f(acct.equity)
+            last_equity = _f(acct.last_equity)
+            day_pl      = equity - last_equity
+            day_plpc    = (day_pl / last_equity * 100) if last_equity else 0.0
+            return {
+                "equity":          equity,
+                "cash":            _f(acct.cash),
+                "portfolio_value": _f(acct.portfolio_value),
+                "buying_power":    _f(acct.buying_power),
+                "unrealized_pl":   _f(getattr(acct, "unrealized_pl",   None)),
+                "unrealized_plpc": _f(getattr(acct, "unrealized_plpc", None)),
+                "last_equity":     last_equity,
+                "day_pl":          round(day_pl, 2),
+                "day_plpc":        round(day_plpc, 4),
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch account P&L: {e}")
+            return None
+
+    def get_positions_pnl(self):
+        """Return per-symbol positions with unrealized P&L from Alpaca."""
+        if not self._ensure_authenticated():
+            return None
+        try:
+            positions = self.trading_client.get_all_positions()
+            return [{
+                "symbol":                   p.symbol,
+                "qty":                      float(p.qty),
+                "side":                     p.side.value,
+                "asset_class":              p.asset_class.value,
+                "avg_entry_price":          float(p.avg_entry_price),
+                "current_price":            float(p.current_price)            if p.current_price            else None,
+                "market_value":             float(p.market_value)             if p.market_value             else None,
+                "cost_basis":               float(p.cost_basis)               if p.cost_basis               else None,
+                "unrealized_pl":            float(p.unrealized_pl)            if p.unrealized_pl            else 0.0,
+                "unrealized_plpc":          float(p.unrealized_plpc)          if p.unrealized_plpc          else 0.0,
+                "unrealized_intraday_pl":   float(p.unrealized_intraday_pl)   if p.unrealized_intraday_pl   else 0.0,
+                "unrealized_intraday_plpc": float(p.unrealized_intraday_plpc) if p.unrealized_intraday_plpc else 0.0,
+            } for p in positions]
+        except Exception as e:
+            logger.error(f"Failed to fetch positions P&L: {e}")
+            return None
+
+    def get_current_orders(self):
+        if not self._ensure_authenticated():
+            logger.error("Unable to fetch current orders: not authenticated.")
+            return None
+
+        try:
+            request = GetOrdersRequest(status="open")
+            orders = self.trading_client.get_orders(request)
+            return [{
+                'order_id': order.id,
+                'symbol': order.symbol,
+                'quantity': order.qty,
+                'side': order.side.value,
+                'type': order.type.value,
+                'status': order.status.value,
+                'submitted_at': order.submitted_at.isoformat() if order.submitted_at else None
+            } for order in orders]
+        except Exception as e:
+            logger.error(f"Failed to fetch current orders: {e}")
+            return None
+
+    def get_order_history(self, limit: int = 50):
+        if not self._ensure_authenticated():
+            logger.error("Unable to fetch order history: not authenticated.")
+            return None
+
+        try:
+            request = GetOrdersRequest(limit=limit)
+            orders = self.trading_client.get_orders(request)
+            return [{
+                'order_id': order.id,
+                'symbol': order.symbol,
+                'quantity': order.qty,
+                'side': order.side.value,
+                'type': order.type.value,
+                'status': order.status.value,
+                'filled_qty': order.filled_qty,
+                'submitted_at': order.submitted_at.isoformat() if order.submitted_at else None,
+                'filled_at': order.filled_at.isoformat() if order.filled_at else None
+            } for order in orders]
+        except Exception as e:
+            logger.error(f"Failed to fetch order history: {e}")
+            return None
+
+alpaca_client = AlpacaClient()

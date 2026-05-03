@@ -1,16 +1,25 @@
-from datetime import datetime
-from typing import Literal, Optional
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, conint, validator
-from app.services.utils import get_audit_log, record_audit_entry
-from app.services.trading_engine import momentum_strategy, MOMENTUM_THRESHOLD_BUY, MOMENTUM_THRESHOLD_SELL, MOMENTUM_WINDOW
-from app.services.webull_client import webull_client
+from datetime import datetime, timezone
+from typing import Annotated, Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field, field_validator, model_validator
+from annotated_types import Gt
+from app.core.auth import require_api_key
+from app.services.utils import get_audit_log, get_audit_entry, record_audit_entry
+from app.services.trading_engine import (
+    momentum_strategy,
+    RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, RSI_PERIOD, SMA_PERIOD,
+    PROFIT_TARGET, STOP_LOSS, DAYS_BEFORE_EXPIRY, OPTION_WEEKS_OUT,
+    MAX_POSITIONS, IV_RANK_MAX, EARNINGS_DAYS_MIN,
+    TRAILING_STOP_ACTIVATION, TRAILING_STOP_PCT,
+    _days_to_expiry,
+)
+from app.services.alpaca_client import alpaca_client
 
-router = APIRouter(prefix="/trades", tags=["trades"])
+router = APIRouter(prefix="/trades", tags=["trades"], dependencies=[Depends(require_api_key)])
 
 class TradeRequest(BaseModel):
     symbol: str = Field(..., min_length=1)
-    quantity: conint(gt=0)
+    quantity: Annotated[int, Gt(0)]
     side: Literal["BUY", "SELL", "SHORT"] = "BUY"
     order_type: Literal["MKT", "LMT", "STP", "STP LMT", "STP TRAIL"] = "MKT"
     price: Optional[float] = None
@@ -19,17 +28,13 @@ class TradeRequest(BaseModel):
     stp_price: Optional[float] = None
     dry_run: bool = False
 
-    @validator("price", always=True)
-    def require_price_for_limit(cls, value, values):
-        if values.get("order_type") == "LMT" and value is None:
+    @model_validator(mode="after")
+    def check_order_type_fields(self) -> "TradeRequest":
+        if self.order_type == "LMT" and self.price is None:
             raise ValueError("price is required for limit orders")
-        return value
-
-    @validator("stp_price", always=True)
-    def require_stp_price_for_stop(cls, value, values):
-        if values.get("order_type") in {"STP", "STP LMT"} and value is None:
+        if self.order_type in {"STP", "STP LMT"} and self.stp_price is None:
             raise ValueError("stp_price is required for stop orders")
-        return value
+        return self
 
 @router.get("/status")
 async def trades_status():
@@ -47,7 +52,7 @@ async def execute_trade(order: TradeRequest):
         "outside_regular_trading_hour": order.outside_regular_trading_hour,
         "stp_price": order.stp_price,
         "dry_run": order.dry_run,
-        "submitted_at": datetime.utcnow().isoformat() + "Z",
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
     if order.dry_run:
@@ -60,7 +65,7 @@ async def execute_trade(order: TradeRequest):
             "id": saved_entry["id"],
         }
 
-    result = webull_client.place_order(
+    result = alpaca_client.place_order(
         symbol=order.symbol.upper(),
         quantity=order.quantity,
         side=order.side,
@@ -93,9 +98,42 @@ async def trade_audit_entry(entry_id: int):
         raise HTTPException(status_code=404, detail="Audit entry not found")
     return {"status": "ok", "entry": entry}
 
+@router.get("/pnl")
+async def pnl_summary():
+    """Account P&L plus per-position unrealized P&L from Alpaca."""
+    account = alpaca_client.get_account_pnl()
+    if account is None:
+        raise HTTPException(status_code=503, detail="Unable to fetch P&L; brokerage service unavailable")
+
+    positions = alpaca_client.get_positions_pnl() or []
+
+    # Realized P&L estimated from audit log using FIFO matching of buys/sells
+    realized_pl = 0.0
+    buys: dict = {}
+    for entry in get_audit_log(limit=1000):
+        sym   = entry.get("symbol", "")
+        side  = entry.get("side", "")
+        qty   = entry.get("quantity", 0) or 0
+        price = float((entry.get("result") or {}).get("filled_avg_price") or entry.get("price") or 0)
+        if not price:
+            continue
+        if side == "BUY":
+            buys.setdefault(sym, []).append({"qty": qty, "price": price})
+        elif side in ("SELL", "SHORT") and buys.get(sym):
+            buy = buys[sym].pop(0)
+            realized_pl += (price - buy["price"]) * min(qty, buy["qty"])
+
+    return {
+        "status": "ok",
+        "account": account,
+        "realized_pl": round(realized_pl, 2),
+        "open_positions": len(positions),
+        "positions": positions,
+    }
+
 @router.get("/current")
 async def current_orders():
-    result = webull_client.get_current_orders()
+    result = alpaca_client.get_current_orders()
     if result is None:
         raise HTTPException(status_code=503, detail="Unable to fetch current orders; brokerage service unavailable")
     return {"status": "ok", "orders": result}
@@ -103,44 +141,80 @@ async def current_orders():
 @router.get("/options/chain/{underlying_symbol}")
 async def get_options_chain(underlying_symbol: str, expiration_date: Optional[str] = None):
     """Get options chain for an underlying symbol"""
-    result = webull_client.get_options_chain(underlying_symbol, expiration_date)
+    result = alpaca_client.get_options_chain(underlying_symbol, expiration_date)
     if result is None:
         raise HTTPException(status_code=503, detail="Unable to fetch options chain; brokerage service unavailable")
     return {"status": "ok", "chain": result}
+
+@router.get("/ai-status")
+async def ai_status():
+    """Show AI advisor state: provider, model, and cached decisions."""
+    from app.services.ai_advisor import ai_advisor
+    import time
+    cached = {}
+    now = time.time()
+    for sym, (ts, decision) in ai_advisor._decision_cache.items():
+        age = int(now - ts)
+        cached[sym] = {**decision, "age_seconds": age}
+    return {
+        "status": "ok",
+        "provider": ai_advisor.get_provider(),
+        "model": ai_advisor.get_model(),
+        "min_confidence": 0.65,
+        "cached_decisions": cached,
+    }
 
 @router.get("/strategy/status")
 async def strategy_status():
     """Get momentum strategy status"""
     status = momentum_strategy.get_status()
 
-    # Add current momentum calculations for all symbols
-    momentum_data = {}
+    # Enrich each stock's signal data with live position info
+    signal_data = {}
     from app.services.trading_engine import WATCHLIST
     for symbol in WATCHLIST:
-        prices = list(momentum_strategy.price_history[symbol])
-        if prices:
-            current_price = prices[-1]
-            momentum = momentum_strategy.calculate_momentum(symbol)
-            momentum_data[symbol] = {
-                "current_price": current_price,
-                "momentum": momentum,
-                "momentum_percent": f"{momentum:.2%}",
-                "data_points": len(prices),
-                "should_buy": momentum_strategy.should_buy(symbol, current_price),
-                "should_sell": momentum_strategy.should_sell(symbol, current_price),
-                "asset_class": "option" if symbol.startswith("O:") else "stock"
-            }
+        sig        = status["signals"].get(symbol, {})
+        opt_sym    = status["option_symbols"].get(symbol)
+        entry_opt  = status["entry_opt_prices"].get(symbol)
+        peak_opt   = status["peak_opt_prices"].get(symbol)
+        days_left  = _days_to_expiry(opt_sym) if opt_sym else None
+        signal_data[symbol] = {
+            "signal":           sig.get("signal", "NONE"),
+            "rsi":              sig.get("rsi"),
+            "sma50":            sig.get("sma50"),
+            "price":            sig.get("price"),
+            "near_sma50":       sig.get("near_sma50"),
+            "vol_above_avg":    sig.get("vol_above_avg"),
+            "hv_rank":          sig.get("hv_rank"),
+            "days_to_earnings": sig.get("days_to_earnings"),
+            "holding_option":   opt_sym,
+            "entry_opt_price":  entry_opt,
+            "peak_opt_price":   peak_opt,
+            "days_to_expiry":   days_left,
+        }
 
     return {
-        "status": "ok",
-        "strategy": "momentum",
+        "status":             "ok",
+        "strategy":           "Daily RSI → ATM call options",
+        "active_positions":   momentum_strategy.active_position_count(),
         "parameters": {
-            "window": MOMENTUM_WINDOW,
-            "buy_threshold": MOMENTUM_THRESHOLD_BUY,
-            "sell_threshold": MOMENTUM_THRESHOLD_SELL,
-            "trade_quantity": 1
+            "rsi_period":              RSI_PERIOD,
+            "rsi_buy_threshold":       RSI_BUY_THRESHOLD,
+            "rsi_sell_threshold":      RSI_SELL_THRESHOLD,
+            "sma_period":              SMA_PERIOD,
+            "profit_target":           f"+{PROFIT_TARGET:.0%}",
+            "stop_loss":               f"-{STOP_LOSS:.0%}",
+            "option_weeks_out":        OPTION_WEEKS_OUT,
+            "days_before_expiry_exit": DAYS_BEFORE_EXPIRY,
+            "max_positions":           MAX_POSITIONS,
+            "iv_rank_max":             f"{IV_RANK_MAX}%",
+            "earnings_days_min":       EARNINGS_DAYS_MIN,
+            "trailing_stop_activation": f"+{TRAILING_STOP_ACTIVATION:.0%}",
+            "trailing_stop_pct":       f"-{TRAILING_STOP_PCT:.0%}",
         },
-        "momentum_data": momentum_data,
-        "positions": status["positions"],
-        "last_trade_prices": status["last_trade_prices"]
+        "last_signal_date":   status["last_signal_date"],
+        "positions":          status["positions"],
+        "option_symbols":     status["option_symbols"],
+        "peak_opt_prices":    status["peak_opt_prices"],
+        "signal_data":        signal_data,
     }

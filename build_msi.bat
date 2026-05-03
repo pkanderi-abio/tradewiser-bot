@@ -1,6 +1,6 @@
 @echo off
 REM TradeWiser Bot - Windows MSI Build Script
-REM Run this script on a Windows machine with Python, PyInstaller, and WiX Toolset installed
+REM Supports WiX Toolset v4/v5 (uses "wix build" instead of candle/light)
 
 echo ========================================
 echo TradeWiser Bot - MSI Build Script
@@ -25,19 +25,48 @@ call venv\Scripts\activate.bat
 REM Install requirements
 echo Installing Python dependencies...
 pip install -r requirements.txt
-pip install pyinstaller
+pip install pyinstaller pywin32
+
+REM Run pywin32 post-install to register DLLs
+echo Registering pywin32...
+python venv\Scripts\pywin32_postinstall.py -install 2>nul
 
 REM Build the main executable
 echo Building main executable...
 pyinstaller --clean --onefile --name tradewiser-bot app\main.py
 
-REM Build the service executable
+REM Build the service executable with all required win32 hidden imports
 echo Building Windows service executable...
-pyinstaller --clean --onefile --name windows_service windows_service.py
+pyinstaller --clean --onefile ^
+  --hidden-import=win32serviceutil ^
+  --hidden-import=win32service ^
+  --hidden-import=win32event ^
+  --hidden-import=servicemanager ^
+  --hidden-import=win32timezone ^
+  --hidden-import=win32api ^
+  --hidden-import=win32con ^
+  --hidden-import=win32security ^
+  --hidden-import=win32process ^
+  --hidden-import=pywintypes ^
+  --name windows_service ^
+  windows_service.py
 
-REM Check if WiX Toolset is installed
+REM Verify service EXE was built
+if not exist "dist\windows_service.exe" (
+    echo ERROR: Failed to build windows_service.exe
+    pause
+    exit /b 1
+)
+
+REM Check for WiX Toolset - support both v3 (candle) and v4 (wix)
+set WIX_VERSION=0
 where candle >nul 2>nul
-if %errorlevel% neq 0 (
+if %errorlevel% equ 0 set WIX_VERSION=3
+
+where wix >nul 2>nul
+if %errorlevel% equ 0 set WIX_VERSION=4
+
+if %WIX_VERSION% equ 0 (
     echo ERROR: WiX Toolset not found. Please install WiX Toolset from:
     echo https://wixtoolset.org/releases/
     pause
@@ -45,9 +74,31 @@ if %errorlevel% neq 0 (
 )
 
 REM Build MSI installer
-echo Building MSI installer...
-candle tradewiser.wxs
-light tradewiser.wixobj
+echo Building MSI installer using WiX v%WIX_VERSION%...
+
+if %WIX_VERSION% equ 3 (
+    REM WiX v3 syntax
+    candle tradewiser_simple.wxs
+    if %errorlevel% neq 0 (
+        echo ERROR: candle failed
+        pause
+        exit /b 1
+    )
+    light tradewiser_simple.wixobj -ext WixToolset.UI.wixext -o tradewiser.msi
+    if %errorlevel% neq 0 (
+        echo ERROR: light failed
+        pause
+        exit /b 1
+    )
+) else (
+    REM WiX v4/v5 syntax
+    wix build tradewiser_simple.wxs -ext WixToolset.UI.wixext -o tradewiser.msi
+    if %errorlevel% neq 0 (
+        echo ERROR: wix build failed
+        pause
+        exit /b 1
+    )
+)
 
 REM Check if MSI was created successfully
 if exist "tradewiser.msi" (
