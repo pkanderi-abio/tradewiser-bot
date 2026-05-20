@@ -22,6 +22,9 @@ async def _populate_expert_watchlist():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logger()
+    from app.core.config import settings
+    if not settings.BOT_API_KEY or settings.BOT_API_KEY == "dev-key-disabled":
+        raise RuntimeError("BOT_API_KEY must be set to a secure value in .env (current value is missing or uses the insecure placeholder)")
     # Start watchlist population in background so startup is instant.
     # The trading loop begins on the default 3 symbols and expands once
     # all 24 expert picks + ATM options have been fetched (~20-30s).

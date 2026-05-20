@@ -37,22 +37,22 @@ def _make_app_with_auth():
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestAuthDisabled:
-    """When BOT_API_KEY is empty, all requests should pass through."""
+class TestAuthAlwaysEnforced:
+    """Authentication is always enforced — no bypass exists for empty keys."""
 
     def setup_method(self):
         self.app = _make_app_with_auth()
         self.client = TestClient(self.app)
 
-    def test_no_header_passes_when_key_not_configured(self):
+    def test_no_header_returns_401_even_when_key_is_empty(self):
         with patch.object(settings, "BOT_API_KEY", ""):
             resp = self.client.get("/protected")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
-    def test_any_value_passes_when_key_not_configured(self):
+    def test_wrong_value_returns_401_even_when_configured_key_is_empty(self):
         with patch.object(settings, "BOT_API_KEY", ""):
             resp = self.client.get("/protected", headers={"X-API-Key": "anything"})
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
 
 class TestAuthEnabled:

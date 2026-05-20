@@ -184,9 +184,10 @@ class TestStrategyStatus:
     def test_strategy_status_contains_parameters(self, client, mock_alpaca):
         data = client.get("/trades/strategy/status").json()
         assert "parameters" in data
-        assert "window" in data["parameters"]
-        assert "buy_threshold" in data["parameters"]
-        assert "sell_threshold" in data["parameters"]
+        # Updated for RSI strategy (replaced the old momentum window-based one)
+        assert "rsi_buy_threshold" in data["parameters"]
+        assert "rsi_sell_threshold" in data["parameters"]
+        assert "max_positions" in data["parameters"]
 
     def test_strategy_status_contains_positions(self, client, mock_alpaca):
         data = client.get("/trades/strategy/status").json()

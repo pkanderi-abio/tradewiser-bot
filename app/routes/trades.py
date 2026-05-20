@@ -2,8 +2,9 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
-from annotated_types import Gt
+from annotated_types import Gt, Le
 from app.core.auth import require_api_key
+from app.core.config import settings
 from app.services.utils import get_audit_log, get_audit_entry, record_audit_entry
 from app.services.trading_engine import (
     momentum_strategy,
@@ -19,7 +20,7 @@ router = APIRouter(prefix="/trades", tags=["trades"], dependencies=[Depends(requ
 
 class TradeRequest(BaseModel):
     symbol: str = Field(..., min_length=1)
-    quantity: Annotated[int, Gt(0)]
+    quantity: Annotated[int, Gt(0), Le(settings.TRADING_MAX_POSITION_SIZE)]
     side: Literal["BUY", "SELL", "SHORT"] = "BUY"
     order_type: Literal["MKT", "LMT", "STP", "STP LMT", "STP TRAIL"] = "MKT"
     price: Optional[float] = None
