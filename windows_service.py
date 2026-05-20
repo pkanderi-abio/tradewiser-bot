@@ -8,14 +8,15 @@ import sys
 import os
 from pathlib import Path
 
-# Add the current directory to Python path
-current_dir = Path(__file__).parent
-sys.path.insert(0, str(current_dir))
+# When running from source, add the project root to sys.path so `app` is importable.
+# When frozen by PyInstaller, all modules are bundled — no path manipulation needed.
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent))
 
 class TradeWiserService(win32serviceutil.ServiceFramework):
     _svc_name_ = "TradeWiserBot"
     _svc_display_name_ = "TradeWiser Trading Bot"
-    _svc_description_ = "Automated trading bot with momentum strategy for Alpaca"
+    _svc_description_ = "Automated trading bot with RSI momentum strategy for Alpaca Markets"
 
     def __init__(self, args):
         win32serviceutil.ServiceFramework.__init__(self, args)
@@ -26,26 +27,27 @@ class TradeWiserService(win32serviceutil.ServiceFramework):
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         win32event.SetEvent(self.hWaitStop)
-        # Signal uvicorn to exit — it polls this flag on every tick
         if self.server is not None:
             self.server.should_exit = True
 
     def SvcDoRun(self):
         servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
-                            servicemanager.PYS_SERVICE_STARTED,
-                            (self._svc_name_, ''))
-
+                              servicemanager.PYS_SERVICE_STARTED,
+                              (self._svc_name_, ''))
         try:
             from app.main import app
             import uvicorn
             import asyncio
 
-            config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info")
+            host = os.environ.get("SERVICE_HOST", "0.0.0.0")
+            port = int(os.environ.get("SERVICE_PORT", "8000"))
+            # log_config=None disables uvicorn's dictConfig setup which fails on Python 3.14
+            config = uvicorn.Config(app, host=host, port=port, log_level="info", log_config=None)
             self.server = uvicorn.Server(config)
             asyncio.run(self.server.serve())
 
         except Exception as e:
-            servicemanager.LogErrorMsg(f"Service failed: {str(e)}")
+            servicemanager.LogErrorMsg(f"TradeWiserBot service failed: {str(e)}")
             raise
 
 if __name__ == '__main__':

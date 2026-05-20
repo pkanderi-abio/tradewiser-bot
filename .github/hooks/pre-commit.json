@@ -1,0 +1,51 @@
+[
+  {
+    "name": "enforce-test-coverage",
+    "description": "Enforce minimum test coverage for trading modules before commit",
+    "lifecycle": ["PreToolUse"],
+    "trigger": {
+      "filePattern": "app/services/trading_engine.py|app/services/ai_advisor.py|app/services/alpaca_client.py",
+      "toolName": "run_in_terminal",
+      "command": "git commit"
+    },
+    "action": "block",
+    "script": {
+      "shell": "powershell",
+      "content": "pytest tests/test_trading_engine.py tests/test_ai_advisor.py tests/test_alpaca_client.py --cov=app/services --cov-fail-under=80"
+    },
+    "errorMessage": "❌ Test coverage for trading modules must be at least 80%. Run 'pytest tests/ --cov=app/services --cov-report=html' to see coverage report.",
+    "allowOverride": true
+  },
+  {
+    "name": "validate-trading-logic",
+    "description": "Validate trading logic changes have corresponding tests",
+    "lifecycle": ["PreToolUse"],
+    "trigger": {
+      "filePattern": "app/services/trading_engine.py|app/services/ai_advisor.py",
+      "toolName": "run_in_terminal",
+      "command": "git commit"
+    },
+    "action": "warn",
+    "script": {
+      "shell": "powershell",
+      "content": "python scripts/validate_trading_tests.py"
+    },
+    "warningMessage": "⚠️ Trading logic changes detected. Ensure corresponding tests are updated in tests/test_trading_engine.py or tests/test_ai_advisor.py"
+  },
+  {
+    "name": "format-python-code",
+    "description": "Auto-format Python code before commits",
+    "lifecycle": ["PreToolUse"],
+    "trigger": {
+      "filePattern": "app/**/*.py|tests/**/*.py",
+      "toolName": "run_in_terminal",
+      "command": "git commit"
+    },
+    "action": "auto",
+    "script": {
+      "shell": "powershell",
+      "content": "black app/ tests/ --line-length=100"
+    },
+    "successMessage": "✅ Python code formatted with Black"
+  }
+]

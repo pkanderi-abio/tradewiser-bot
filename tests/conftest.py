@@ -11,7 +11,7 @@ import os
 os.environ.setdefault("ALPACA_API_KEY", "test_key_id")
 os.environ.setdefault("ALPACA_SECRET_KEY", "test_secret_key")
 os.environ.setdefault("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-os.environ.setdefault("BOT_API_KEY", "")
+os.environ.setdefault("BOT_API_KEY", "test-bot-api-key-for-pytest")
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -30,10 +30,10 @@ async def _idle_trading_loop():
 
 @pytest.fixture
 def client():
-    """Unauthenticated TestClient (BOT_API_KEY is empty — auth disabled)."""
+    """Authenticated TestClient — sends TEST_API_KEY on every request."""
     with patch("app.main.start_trading_loop", _idle_trading_loop):
         from app.main import app
-        with TestClient(app) as c:
+        with TestClient(app, headers={"X-API-Key": TEST_API_KEY}) as c:
             yield c
 
 

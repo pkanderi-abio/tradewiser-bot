@@ -11,10 +11,11 @@ def test_settings_loads_required_fields():
     assert settings.ALPACA_BASE_URL
 
 
-def test_settings_bot_api_key_defaults_to_empty():
+def test_settings_bot_api_key_is_a_string():
     from app.core.config import settings
-    # BOT_API_KEY is optional — should default to empty string when not set
+    # BOT_API_KEY is required — must be set before the service starts
     assert isinstance(settings.BOT_API_KEY, str)
+    assert len(settings.BOT_API_KEY) > 0
 
 
 def test_settings_poll_interval_is_int():

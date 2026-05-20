@@ -1,10 +1,25 @@
-# TradeWiser Bot - Status Dashboard (PowerShell 5.1 compatible)
+﻿# TradeWiser Bot - Status Dashboard (PowerShell 5.1 compatible)
 # Run: .\status.ps1   or right-click -> Run with PowerShell
 
 param(
     [string]$ApiKey  = "",
     [string]$BaseUrl = "http://127.0.0.1:8000"
 )
+
+# Resolve API key: parameter > env var > installed .env file
+if (-not $ApiKey) { $ApiKey = $env:BOT_API_KEY }
+if (-not $ApiKey) {
+    $envPaths = @(
+        "C:\Program Files (x86)\TradeWiser\TradeWiser Bot\.env",
+        "$PSScriptRoot\.env"
+    )
+    foreach ($envPath in $envPaths) {
+        if (Test-Path $envPath) {
+            $line = Get-Content $envPath | Select-String "^BOT_API_KEY=" | Select-Object -First 1
+            if ($line) { $ApiKey = $line.ToString().Split("=", 2)[1].Trim(); break }
+        }
+    }
+}
 
 function Write-Section($text) {
     Write-Host ""
