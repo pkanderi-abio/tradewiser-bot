@@ -12,9 +12,11 @@ from app.services.trading_engine import (
     _compute_rsi,
     _days_to_expiry,
     _parse_underlying,
+    get_daily_signal,
     momentum_strategy,
     rsi_strategy,
 )
+from app.core.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -171,3 +173,67 @@ class TestStrategyConstants:
 
     def test_trade_quantity_is_positive(self):
         assert TRADE_QUANTITY > 0
+
+
+# ---------------------------------------------------------------------------
+# STRATEGY_REQUIRE_UPTREND_FILTER — toggles the price>SMA50 trend gate
+# ---------------------------------------------------------------------------
+
+def _build_history(close_series, vol_series=None):
+    """yfinance-shaped DataFrame the get_daily_signal code path expects."""
+    if vol_series is None:
+        vol_series = [1_000_000] * len(close_series)
+    idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=len(close_series), freq="D")
+    return pd.DataFrame(
+        {"Close": close_series, "Volume": vol_series, "High": close_series,
+         "Low": close_series, "Open": close_series},
+        index=idx,
+    )
+
+
+class TestUptrendFilter:
+    """The user can disable the trend filter to allow buying oversold names in
+    downtrends. Default is True (preserve historic behavior); when False, the
+    RSI<35 check alone is enough to produce a BUY signal."""
+
+    def _oversold_downtrend_history(self):
+        # Build a series that ends well below its 50-day SMA with a low RSI.
+        # 200 days of falling prices: starts at 200, ends near 100 → RSI low,
+        # price way under SMA50.
+        prices = [200 - i * 0.5 for i in range(200)]
+        return _build_history(prices)
+
+    def _patch_signal_inputs(self, monkeypatch, hist):
+        """Patch the data sources get_daily_signal uses so the test is offline
+        and so we isolate the trend-filter behavior from the HV-rank and
+        earnings gates (each tested separately in their own scope)."""
+        monkeypatch.setattr("app.services.trading_engine._get_days_to_earnings",
+                            lambda s: None)
+        monkeypatch.setattr("app.services.trading_engine._get_hv_rank_from_hist",
+                            lambda h: 30.0)  # below IV_RANK_MAX=50
+        ticker_mock = patch("app.services.trading_engine.yf.Ticker").start()
+        ticker_mock.return_value.history.return_value = hist
+        return ticker_mock
+
+    def test_default_filter_blocks_buy_in_downtrend(self, monkeypatch):
+        """Default (filter on) — oversold-but-below-SMA50 must NOT BUY."""
+        monkeypatch.setattr(settings, "STRATEGY_REQUIRE_UPTREND_FILTER", True)
+        self._patch_signal_inputs(monkeypatch, self._oversold_downtrend_history())
+        try:
+            sig = get_daily_signal("FAKE")
+        finally:
+            patch.stopall()
+        assert sig["signal"] != "BUY"
+        assert sig["rsi"] is not None
+        assert sig["rsi"] < RSI_BUY_THRESHOLD  # confirm it was actually oversold
+
+    def test_relaxed_filter_allows_buy_in_downtrend(self, monkeypatch):
+        """Filter off — same oversold downtrend setup should now produce BUY."""
+        monkeypatch.setattr(settings, "STRATEGY_REQUIRE_UPTREND_FILTER", False)
+        self._patch_signal_inputs(monkeypatch, self._oversold_downtrend_history())
+        try:
+            sig = get_daily_signal("FAKE")
+        finally:
+            patch.stopall()
+        assert sig["signal"] == "BUY", f"expected BUY but got {sig}"
+        assert sig["rsi"] < RSI_BUY_THRESHOLD

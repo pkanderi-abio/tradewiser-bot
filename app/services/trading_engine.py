@@ -10,8 +10,17 @@ import yfinance as yf
 from app.services.alpaca_client import alpaca_client
 from app.services.utils import record_audit_entry
 from app.services.ai_advisor import ai_advisor, MIN_CONFIDENCE
+from app.services.risk_gate import risk_gate
+from app.services.regime import regime_gate
 from app.core.logger import logger
 from app.core.config import settings
+
+
+def _estimate_option_notional(stock_price: float, qty: int) -> float:
+    """ATM ~4-week call premiums run roughly 3–5% of the underlying; we use 5%
+    as a conservative overestimate so the concentration check leans cautious.
+    Multiplier 100 = standard equity option contract size."""
+    return max(0.0, float(stock_price) * 0.05 * 100 * qty)
 
 # Underlying stocks only — options are generated at trade time
 WATCHLIST: List[str] = ["SPY", "QQQ", "AAPL"]
@@ -120,8 +129,15 @@ def get_daily_signal(symbol: str) -> dict:
             signal = "SELL"
             reason = f"RSI={rsi:.1f} overbought"
 
-        elif rsi < RSI_BUY_THRESHOLD and price > sma50 and (near_sma50 or vol_above_avg):
-            # Additional gatekeepers before opening a new position
+        elif rsi < RSI_BUY_THRESHOLD and (
+            not settings.STRATEGY_REQUIRE_UPTREND_FILTER
+            or (price > sma50 and (near_sma50 or vol_above_avg))
+        ):
+            # Additional gatekeepers before opening a new position. The trend
+            # filter (price > SMA50 + near-SMA or above-avg-volume) was the
+            # safety against catching falling knives; STRATEGY_REQUIRE_UPTREND_FILTER
+            # lets the operator opt into trading oversold downtrends. Other
+            # gates (regime / AI / risk) still run downstream.
             if hv_rank is not None and hv_rank > IV_RANK_MAX:
                 signal = "NONE"
                 reason = f"HV rank {hv_rank:.0f}% > {IV_RANK_MAX}% — options expensive"
@@ -371,12 +387,28 @@ async def start_trading_loop():
                             },
                         )
                         if decision["action"] == "SELL" and decision["confidence"] >= MIN_CONFIDENCE:
-                            rsi_strategy.execute_sell(sym, sig["price"] or 0, "RSI overbought")
+                            risk = await asyncio.to_thread(
+                                risk_gate.evaluate, sym, "SELL", 0.0
+                            )
+                            if risk.approved:
+                                rsi_strategy.execute_sell(sym, sig["price"] or 0, "RSI overbought")
+                            else:
+                                logger.warning(f"[RISK] SELL blocked for {sym} — {risk.reason}")
                         else:
                             logger.info(f"[AI] SELL filtered for {sym} — {decision['reason']}")
 
                 # Sort BUY candidates by RSI ascending (most oversold = highest priority)
                 buy_candidates.sort(key=lambda x: x[1].get("rsi") or 100)
+
+                # Regime gate — global skip when the macro environment is adverse.
+                # Runs once per pass; per-symbol AI + risk still apply for survivors.
+                regime_decision = await asyncio.to_thread(regime_gate.classify)
+                if buy_candidates and not regime_decision.allow_new_buys:
+                    logger.warning(
+                        f"[REGIME] BUY phase skipped — {regime_decision.regime}: "
+                        f"{regime_decision.reason}"
+                    )
+                    buy_candidates = []
 
                 for sym, sig in buy_candidates:
                     if not rsi_strategy.has_capacity():
@@ -403,6 +435,15 @@ async def start_trading_loop():
                         },
                     )
                     if decision["action"] == "BUY" and decision["confidence"] >= MIN_CONFIDENCE:
+                        stock_price = sig["price"] or 0
+                        notional = _estimate_option_notional(stock_price, TRADE_QUANTITY)
+                        risk = await asyncio.to_thread(
+                            risk_gate.evaluate, sym, "BUY", notional
+                        )
+                        if not risk.approved:
+                            logger.warning(f"[RISK] BUY blocked for {sym} — {risk.reason}")
+                            continue
+
                         try:
                             opts     = await asyncio.to_thread(
                                 get_atm_option_symbols, sym, OPTION_WEEKS_OUT
@@ -411,7 +452,7 @@ async def start_trading_loop():
                         except Exception as e:
                             logger.warning(f"[BUY] Option lookup failed for {sym}: {e}")
                             call_sym = None
-                        rsi_strategy.execute_buy(sym, sig["price"] or 0, call_sym)
+                        rsi_strategy.execute_buy(sym, stock_price, call_sym)
                     else:
                         logger.info(f"[AI] BUY filtered for {sym} — {decision['reason']}")
 

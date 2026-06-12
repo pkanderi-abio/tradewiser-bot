@@ -1,5 +1,6 @@
 # app/services/alpaca_client.py — Alpaca Markets trading client
 
+import time
 from typing import Optional, Dict, Any
 import logging
 from alpaca.trading.client import TradingClient
@@ -13,7 +14,16 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 class AlpacaClient:
-    """Alpaca trading client - supports stocks and options"""
+    """Alpaca trading client - supports stocks and options.
+
+    Authentication failures used to latch _auth_failed permanently, which meant
+    a single startup blip silently disabled trading for the whole process
+    lifetime (we hit this on 2026-05-12: the bot ran for 27 days unable to
+    talk to the broker). Auth now uses a cooldown window — we still avoid
+    hammering Alpaca after a failure, but a transient failure no longer
+    requires a service restart to recover. The cooldown is
+    settings.ALPACA_AUTH_RETRY_COOLDOWN_SECONDS (default 60).
+    """
 
     def __init__(self):
         self.trading_client = TradingClient(
@@ -30,8 +40,12 @@ class AlpacaClient:
             secret_key=settings.ALPACA_SECRET_KEY
         )
         self.authenticated = False
-        self._auth_failed = False
+        self._auth_failed = False              # latched within the cooldown window only
         self._account_id: Optional[str] = None
+        self._last_auth_attempt: float = 0.0   # epoch; 0 = never attempted
+        self._last_auth_error: Optional[str] = None
+        self._consecutive_auth_failures: int = 0
+        self._last_auth_success: Optional[float] = None
 
     def login(self) -> bool:
         """Alpaca doesn't require explicit login - authentication is via API keys"""
@@ -40,23 +54,78 @@ class AlpacaClient:
     def _ensure_authenticated(self) -> bool:
         if self.authenticated:
             return True
-        if self._auth_failed:
-            return False
 
+        # Auth failed recently? Don't hammer — wait out the cooldown.
+        if self._auth_failed:
+            elapsed = time.time() - self._last_auth_attempt
+            cooldown = settings.ALPACA_AUTH_RETRY_COOLDOWN_SECONDS
+            if elapsed < cooldown:
+                return False
+            # Cooldown elapsed — clear the latch and fall through to retry.
+            logger.info(
+                f"Alpaca auth cooldown elapsed ({elapsed:.0f}s >= {cooldown}s) — retrying auth "
+                f"(consecutive failures so far: {self._consecutive_auth_failures})"
+            )
+            self._auth_failed = False
+
+        self._last_auth_attempt = time.time()
         try:
             account = self.trading_client.get_account()
             if account:
                 self.authenticated = True
                 self._account_id = account.id
+                self._last_auth_error = None
+                self._consecutive_auth_failures = 0
+                self._last_auth_success = self._last_auth_attempt
                 logger.info("Alpaca authentication successful.")
                 return True
             logger.error("Alpaca authentication failed - no account info")
             self._auth_failed = True
+            self._last_auth_error = "no account info returned"
+            self._consecutive_auth_failures += 1
             return False
         except Exception as e:
             logger.error(f"Alpaca authentication failed: {e}")
             self._auth_failed = True
+            self._last_auth_error = f"{type(e).__name__}: {str(e)[:160]}"
+            self._consecutive_auth_failures += 1
             return False
+
+    def broker_snapshot(self) -> Dict[str, Any]:
+        """State for the /health/broker endpoint.
+
+        Surfaces the auth state, last error, cooldown progress, and how long
+        ago the last successful authentication happened. This is the
+        thing operators look at when 'why no trades' comes up — without
+        this, the only signal was an empty audit log, which is the same
+        appearance whether the bot is healthy and quiet or broken and silent.
+        """
+        now = time.time()
+        cooldown = settings.ALPACA_AUTH_RETRY_COOLDOWN_SECONDS
+        seconds_since_attempt = (now - self._last_auth_attempt) if self._last_auth_attempt else None
+        seconds_until_retry = None
+        if self._auth_failed and seconds_since_attempt is not None:
+            seconds_until_retry = max(0.0, cooldown - seconds_since_attempt)
+        return {
+            "authenticated": self.authenticated,
+            "auth_failed_latched": self._auth_failed,
+            "consecutive_failures": self._consecutive_auth_failures,
+            "last_error": self._last_auth_error,
+            "last_attempt_age_seconds": (
+                round(seconds_since_attempt, 1) if seconds_since_attempt is not None else None
+            ),
+            "last_success_age_seconds": (
+                round(now - self._last_auth_success, 1)
+                if self._last_auth_success is not None else None
+            ),
+            "retry_cooldown_seconds": cooldown,
+            "seconds_until_retry": (
+                round(seconds_until_retry, 1) if seconds_until_retry is not None else None
+            ),
+            "base_url": settings.ALPACA_BASE_URL,
+            "paper_mode": "paper" in settings.ALPACA_BASE_URL,
+            "account_id": self._account_id,
+        }
 
     def get_quote(self, symbol: str):
         """Get quote for stock or option symbol"""

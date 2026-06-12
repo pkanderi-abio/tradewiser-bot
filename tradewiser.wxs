@@ -58,10 +58,22 @@
         <File Id="HealthPy" Source="app\routes\health.py" />
       </Component>
 
-      <!-- Service files -->
+      <!-- Service files — Webull was replaced by Alpaca; runtime logic ships
+           inside the PyInstaller bundle (dist\tradewiser-bot.exe).  These
+           on-disk source files are kept for post-install inspection; the
+           sync-to-installed.ps1 script handles fuller source refreshes. -->
       <Component Id="ServiceFiles" Guid="12345678-1234-1234-1234-123456789ABE">
         <File Id="TradingEnginePy" Source="app\services\trading_engine.py" KeyPath="yes" />
-        <File Id="WebullClientPy" Source="app\services\webull_client.py" />
+        <File Id="AlpacaClientPy" Source="app\services\alpaca_client.py" />
+        <File Id="AiAdvisorPy" Source="app\services\ai_advisor.py" />
+        <File Id="AiGuardrailsPy" Source="app\services\ai_guardrails.py" />
+        <File Id="RiskGatePy" Source="app\services\risk_gate.py" />
+        <File Id="RegimePy" Source="app\services\regime.py" />
+        <File Id="MarketDataPy" Source="app\services\market_data.py" />
+        <File Id="NewsFeedPy" Source="app\services\news_feed.py" />
+        <File Id="SentimentFeedPy" Source="app\services\sentiment_feed.py" />
+        <File Id="PnlPy" Source="app\services\pnl.py" />
+        <File Id="WatchlistManagerPy" Source="app\services\watchlist_manager.py" />
         <File Id="UtilsPy" Source="app\services\utils.py" />
       </Component>
 

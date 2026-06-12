@@ -5,7 +5,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from annotated_types import Gt, Le
 from app.core.auth import require_api_key
 from app.core.config import settings
-from app.services.utils import get_audit_log, get_audit_entry, record_audit_entry
+from app.services.utils import (
+    get_audit_log, get_audit_entry, record_audit_entry,
+    get_ai_decisions, ai_decision_stats, ai_token_stats,
+    get_risk_events,
+)
 from app.services.trading_engine import (
     momentum_strategy,
     RSI_BUY_THRESHOLD, RSI_SELL_THRESHOLD, RSI_PERIOD, SMA_PERIOD,
@@ -148,8 +152,8 @@ async def get_options_chain(underlying_symbol: str, expiration_date: Optional[st
     return {"status": "ok", "chain": result}
 
 @router.get("/ai-status")
-async def ai_status():
-    """Show AI advisor state: provider, model, and cached decisions."""
+async def ai_status(window_minutes: int = 60, recent_limit: int = 20, tokens_window_minutes: int = 1440):
+    """AI advisor state: provider, model, circuit breaker, recent decisions, error rate, token spend."""
     from app.services.ai_advisor import ai_advisor
     import time
     cached = {}
@@ -159,11 +163,30 @@ async def ai_status():
         cached[sym] = {**decision, "age_seconds": age}
     return {
         "status": "ok",
-        "provider": ai_advisor.get_provider(),
-        "model": ai_advisor.get_model(),
-        "min_confidence": 0.65,
+        "advisor": ai_advisor.snapshot(),
         "cached_decisions": cached,
+        "stats": ai_decision_stats(window_minutes=window_minutes),
+        "tokens": ai_token_stats(window_minutes=tokens_window_minutes),
+        "recent": get_ai_decisions(limit=recent_limit),
     }
+
+
+@router.get("/risk-status")
+async def risk_status(recent_limit: int = 20):
+    """Pre-trade risk gate posture: equity, day P&L, drawdown, concentration, recent events."""
+    from app.services.risk_gate import risk_gate
+    return {
+        "status": "ok",
+        "risk": risk_gate.snapshot(),
+        "recent_events": get_risk_events(limit=recent_limit),
+    }
+
+
+@router.get("/market-regime")
+async def market_regime():
+    """Macro regime classification — VIX, SPY trend, and whether new BUYs are gated."""
+    from app.services.regime import regime_gate
+    return {"status": "ok", **regime_gate.snapshot()}
 
 @router.get("/strategy/status")
 async def strategy_status():

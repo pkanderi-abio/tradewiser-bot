@@ -12,6 +12,9 @@ os.environ.setdefault("ALPACA_API_KEY", "test_key_id")
 os.environ.setdefault("ALPACA_SECRET_KEY", "test_secret_key")
 os.environ.setdefault("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 os.environ.setdefault("BOT_API_KEY", "test-bot-api-key-for-pytest")
+# In-memory SQLite keeps the trade_audit / ai_decisions tables isolated to the
+# pytest process — production uses a file on disk via AI_AUDIT_DB_PATH.
+os.environ.setdefault("AI_AUDIT_DB_PATH", ":memory:")
 
 import pytest
 from unittest.mock import MagicMock, patch
