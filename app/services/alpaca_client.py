@@ -4,8 +4,13 @@ import time
 from typing import Optional, Dict, Any
 import logging
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    LimitOrderRequest,
+    GetOrdersRequest,
+    GetOptionContractsRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, ContractType, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, OptionChainRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from app.core.config import settings
@@ -46,6 +51,9 @@ class AlpacaClient:
         self._last_auth_error: Optional[str] = None
         self._consecutive_auth_failures: int = 0
         self._last_auth_success: Optional[float] = None
+        # Captures the last broker error from place_order so callers can persist
+        # the real reason instead of writing the opaque "Alpaca rejected" string.
+        self.last_order_error: Optional[str] = None
 
     def login(self) -> bool:
         """Alpaca doesn't require explicit login - authentication is via API keys"""
@@ -265,7 +273,9 @@ class AlpacaClient:
                    price: Optional[float] = None, enforce: str = "GTC",
                    outside_regular_trading_hour: bool = False,
                    stp_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        self.last_order_error = None
         if not self._ensure_authenticated():
+            self.last_order_error = "not authenticated"
             logger.error("Unable to place order: not authenticated.")
             return None
 
@@ -277,6 +287,7 @@ class AlpacaClient:
                 return self._place_stock_order(symbol, quantity, side, order_type, price, enforce)
 
         except Exception as e:
+            self.last_order_error = str(e)
             logger.error(f"Failed to place order: {e}")
             return None
 
@@ -341,6 +352,7 @@ class AlpacaClient:
                             limit_price = bid or ask or last or 0.01
 
             if not limit_price or float(limit_price) <= 0:
+                self.last_order_error = "no valid options quote available"
                 logger.error(f"Cannot place options order for {symbol}: no valid price available")
                 return None
 
@@ -369,6 +381,7 @@ class AlpacaClient:
             }
 
         except Exception as e:
+            self.last_order_error = str(e)
             logger.error(f"Failed to place options order for {symbol}: {e}")
             return None
 
@@ -420,6 +433,44 @@ class AlpacaClient:
             }
         except Exception as e:
             logger.error(f"Failed to fetch account P&L: {e}")
+            return None
+
+    def list_option_contracts(self, underlying: str, expiry, opt_type: str = "call",
+                              strike_min: Optional[float] = None,
+                              strike_max: Optional[float] = None):
+        """Return active listed option contracts for an underlying + expiry.
+
+        Used by the watchlist's ATM picker to snap to a real listed strike
+        instead of computing one heuristically — e.g. AMZN at ~$238 has $5
+        strike spacing on weeklies, not $1, and the hardcoded picker was
+        generating contracts that don't exist and getting 404s from Alpaca.
+        """
+        if not self._ensure_authenticated():
+            return None
+        try:
+            ctype = ContractType.CALL if opt_type.lower() == "call" else ContractType.PUT
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying.upper()],
+                status=AssetStatus.ACTIVE,
+                expiration_date=expiry,
+                type=ctype,
+                strike_price_gte=str(strike_min) if strike_min is not None else None,
+                strike_price_lte=str(strike_max) if strike_max is not None else None,
+                limit=200,
+            )
+            resp = self.trading_client.get_option_contracts(req)
+            contracts = getattr(resp, "option_contracts", None)
+            if contracts is None and isinstance(resp, dict):
+                contracts = resp.get("option_contracts", [])
+            return [{
+                "symbol":          c.symbol,
+                "strike_price":    float(c.strike_price),
+                "expiration_date": str(c.expiration_date),
+                "type":            c.type.value if hasattr(c.type, "value") else str(c.type),
+                "tradable":        bool(getattr(c, "tradable", True)),
+            } for c in (contracts or [])]
+        except Exception as e:
+            logger.error(f"Failed to list option contracts for {underlying} {expiry}: {e}")
             return None
 
     def get_positions_pnl(self):

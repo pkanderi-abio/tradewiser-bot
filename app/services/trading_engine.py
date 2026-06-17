@@ -243,9 +243,10 @@ class DailyRSIStrategy:
                 self._audit(symbol, "BUY", TRADE_QUANTITY, stock_price, "submitted",
                             option_symbol=call_symbol)
                 return True
-            logger.error(f"[ERROR] Alpaca rejected buy for {symbol} ({call_symbol})")
+            broker_err = alpaca_client.last_order_error or "Alpaca rejected"
+            logger.error(f"[ERROR] BUY rejected for {symbol} ({call_symbol}): {broker_err}")
             self._audit(symbol, "BUY", TRADE_QUANTITY, stock_price, "failed",
-                        "Alpaca rejected", call_symbol)
+                        broker_err, call_symbol)
             return False
         except Exception as e:
             logger.error(f"[ERROR] Buy error for {symbol}: {e}")
@@ -275,9 +276,10 @@ class DailyRSIStrategy:
                 self._audit(symbol, "SELL", qty, stock_price, "submitted",
                             detail=reason, option_symbol=call_symbol)
                 return True
-            logger.error(f"[ERROR] Alpaca rejected sell for {symbol} ({call_symbol})")
+            broker_err = alpaca_client.last_order_error or "Alpaca rejected"
+            logger.error(f"[ERROR] SELL rejected for {symbol} ({call_symbol}): {broker_err}")
             self._audit(symbol, "SELL", qty, stock_price, "failed",
-                        "Alpaca rejected", call_symbol)
+                        broker_err, call_symbol)
             return False
         except Exception as e:
             logger.error(f"[ERROR] Sell error for {symbol}: {e}")
@@ -294,6 +296,50 @@ class DailyRSIStrategy:
             "signals":            dict(self.signals),
             "last_signal_date":   str(self.last_signal_date) if self.last_signal_date else None,
         }
+
+    def sync_from_alpaca(self) -> Optional[int]:
+        """Reconcile in-memory positions against Alpaca's actual book.
+
+        Without this, the bot can fire SELLs for positions it doesn't actually
+        own (e.g. BUY order accepted but never filled by EOD on DAY TIF) and
+        Alpaca rejects them as uncovered. Returns the synced position count, or
+        None if Alpaca is unreachable (caller must keep local state in that case).
+        """
+        live = alpaca_client.get_positions_pnl()
+        if live is None:
+            return None
+
+        live_by_underlying: Dict[str, Dict] = {}
+        for pos in live:
+            qty = int(float(pos["qty"]))
+            if qty <= 0 or pos.get("asset_class") != "us_option":
+                continue
+            underlying = _parse_underlying(pos["symbol"])
+            if underlying:
+                live_by_underlying[underlying] = pos
+
+        # Drop locally-tracked underlyings that Alpaca no longer holds.
+        tracked = {s for s, q in self.positions.items() if q > 0}
+        for stale in tracked - live_by_underlying.keys():
+            self.positions[stale] = 0
+            self.option_symbols.pop(stale, None)
+            self.entry_opt_prices.pop(stale, None)
+            self.entry_stock_prices.pop(stale, None)
+            self.peak_opt_prices.pop(stale, None)
+
+        # Adopt or refresh positions that Alpaca confirms.
+        for underlying, pos in live_by_underlying.items():
+            qty = int(float(pos["qty"]))
+            self.positions[underlying]      = qty
+            self.option_symbols[underlying] = f"O:{pos['symbol']}"
+            entry = float(pos.get("avg_entry_price") or 0)
+            # Seed entry/peak only when we don't already have a richer local value.
+            if entry and not self.entry_opt_prices.get(underlying):
+                self.entry_opt_prices[underlying] = entry
+            if entry and not self.peak_opt_prices.get(underlying):
+                self.peak_opt_prices[underlying] = entry
+
+        return len(live_by_underlying)
 
 
 rsi_strategy = DailyRSIStrategy()
@@ -316,28 +362,20 @@ async def start_trading_loop():
 
     alpaca_client.login()
 
-    # Sync any existing option positions from Alpaca on startup
-    live = alpaca_client.get_positions_pnl()
-    if live:
-        synced = 0
-        for pos in live:
-            sym         = pos["symbol"]
-            qty         = int(float(pos["qty"]))
-            asset_class = pos.get("asset_class", "")
-            if qty <= 0 or asset_class != "us_option":
-                continue
-            underlying = _parse_underlying(sym)
-            if underlying:
-                rsi_strategy.positions[underlying]      = qty
-                rsi_strategy.option_symbols[underlying] = f"O:{sym}"
-                synced += 1
-        logger.info(f"[STARTUP] Synced {synced} option position(s) from Alpaca")
+    synced = rsi_strategy.sync_from_alpaca()
+    if synced is None:
+        logger.warning("[STARTUP] Alpaca unreachable — running with empty position state")
     else:
-        logger.info("[STARTUP] No open positions to sync")
+        logger.info(f"[STARTUP] Synced {synced} option position(s) from Alpaca")
 
     while True:
         try:
             today = date.today()
+
+            # Reconcile every iteration: an unfilled BUY (DAY TIF) or a manual
+            # close on the dashboard would otherwise leave the in-memory dict
+            # out of sync, which leads to uncovered-option rejections on SELL.
+            rsi_strategy.sync_from_alpaca()
 
             # ── Once-per-day: compute RSI signals and open new positions ───────
             if rsi_strategy.last_signal_date != today:

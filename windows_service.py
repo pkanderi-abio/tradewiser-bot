@@ -35,6 +35,16 @@ class TradeWiserService(win32serviceutil.ServiceFramework):
                               servicemanager.PYS_SERVICE_STARTED,
                               (self._svc_name_, ''))
         try:
+            # LocalSystem starts every service with cwd=C:\Windows\System32, which
+            # is also where any relative config path (the audit DB, env file, etc.)
+            # ends up by default. Pin cwd to the install directory so SQLite,
+            # .env, and any other relative I/O land alongside the service binary.
+            if getattr(sys, 'frozen', False):
+                install_dir = Path(sys.executable).parent
+            else:
+                install_dir = Path(__file__).parent
+            os.chdir(install_dir)
+
             from app.main import app
             import uvicorn
             import asyncio

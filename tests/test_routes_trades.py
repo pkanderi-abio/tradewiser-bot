@@ -30,6 +30,7 @@ class TestExecuteTrade:
 
     def test_execute_returns_503_when_broker_fails(self, client, mock_alpaca):
         mock_alpaca.place_order.return_value = None
+        mock_alpaca.last_order_error = None
         resp = client.post("/trades/execute", json={
             "symbol": "AAPL",
             "quantity": 1,

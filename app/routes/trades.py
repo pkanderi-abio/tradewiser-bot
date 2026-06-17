@@ -82,8 +82,9 @@ async def execute_trade(order: TradeRequest):
     )
 
     if result is None:
+        broker_err = alpaca_client.last_order_error
         audit_entry["status"] = "failed"
-        audit_entry["detail"] = "Unable to place order; brokerage service unavailable"
+        audit_entry["detail"] = broker_err or "Unable to place order; brokerage service unavailable"
         saved_entry = record_audit_entry(audit_entry)
         raise HTTPException(status_code=503, detail=audit_entry["detail"])
 

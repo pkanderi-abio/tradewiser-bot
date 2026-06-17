@@ -165,14 +165,39 @@ def _occ_symbol(root: str, expiry: date, opt_type: str, strike: float) -> str:
 
 
 def get_atm_option_symbols(symbol: str, weeks_out: int = 2) -> List[str]:
-    """Return [call_symbol, put_symbol] at the nearest ATM strike for the given underlying."""
+    """Return [call_symbol, put_symbol] at the nearest ATM strike for the given underlying.
+
+    Snaps to a strike that Alpaca actually lists for the chosen expiry. Without
+    this, the heuristic picker can land on a strike that isn't listed (e.g.
+    AMZN ~$238 has $5 weekly spacing, not $1) and every order gets rejected
+    with a 404. We query Alpaca's contracts endpoint and pick the listed
+    strike closest to the current price, then fall back to the heuristic only
+    if the listing API is unreachable.
+    """
     try:
         info = yf.Ticker(symbol.replace(".", "-")).info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if not price:
             return []
-        strike = _atm_strike(float(price))
+        price  = float(price)
         expiry = _next_expiry_friday(weeks_out)
+
+        # Try Alpaca's listed strikes first — authoritative for "does this
+        # contract exist". Import here to avoid a circular import at module load.
+        from app.services.alpaca_client import alpaca_client
+
+        listed = alpaca_client.list_option_contracts(
+            symbol, expiry, "call",
+            strike_min=price * 0.9, strike_max=price * 1.1,
+        )
+        if listed:
+            tradable = [c for c in listed if c.get("tradable", True)]
+            pool = tradable or listed
+            nearest = min(pool, key=lambda c: abs(c["strike_price"] - price))
+            strike = nearest["strike_price"]
+        else:
+            strike = _atm_strike(price)
+
         return [
             _occ_symbol(symbol, expiry, "C", strike),
             _occ_symbol(symbol, expiry, "P", strike),
