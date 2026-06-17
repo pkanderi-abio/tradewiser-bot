@@ -1,0 +1,47 @@
+{
+  "SPY": {
+    "provider": "alpaca",
+    "access_method": "alpaca_cli",
+    "feed": "sip",
+    "adjustment": "split",
+    "timeframe": "1Day",
+    "total_bars_fetched": 827,
+    "bars_after_filter": 751,
+    "first_bar_ts": "2023-01-03T05:00:00+00:00",
+    "last_bar_ts": "2025-12-30T05:00:00+00:00",
+    "close_sum": 397586.74,
+    "volume_sum": 52995004659,
+    "calendar_filter": "regular_hours_daily",
+    "raw_file_hash": "b6458e989db582e1f4aaba3f927a52dd9535f595cfc8508f357334a9bce3e6c7"
+  },
+  "QQQ": {
+    "provider": "alpaca",
+    "access_method": "alpaca_cli",
+    "feed": "sip",
+    "adjustment": "split",
+    "timeframe": "1Day",
+    "total_bars_fetched": 827,
+    "bars_after_filter": 751,
+    "first_bar_ts": "2023-01-03T05:00:00+00:00",
+    "last_bar_ts": "2025-12-30T05:00:00+00:00",
+    "close_sum": 340215.45,
+    "volume_sum": 34639700770,
+    "calendar_filter": "regular_hours_daily",
+    "raw_file_hash": "1dcad00b6175d8e0ee6388b31dc81f0de59cf2b4e1c57e93a0b7a593f78c0b8c"
+  },
+  "AAPL": {
+    "provider": "alpaca",
+    "access_method": "alpaca_cli",
+    "feed": "sip",
+    "adjustment": "split",
+    "timeframe": "1Day",
+    "total_bars_fetched": 827,
+    "bars_after_filter": 751,
+    "first_bar_ts": "2023-01-03T05:00:00+00:00",
+    "last_bar_ts": "2025-12-30T05:00:00+00:00",
+    "close_sum": 153141.4,
+    "volume_sum": 43392004251,
+    "calendar_filter": "regular_hours_daily",
+    "raw_file_hash": "518631057b7ef81e9940cc387416025f20566a76805fcbf911a53e2c5c24bdc3"
+  }
+}
