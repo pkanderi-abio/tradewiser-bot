@@ -10,7 +10,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     GetOptionContractsRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, ContractType, AssetStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, ContractType, AssetStatus, PositionIntent, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, OptionChainRequest, OptionLatestQuoteRequest, OptionSnapshotRequest
 from app.core.config import settings
@@ -269,6 +269,31 @@ class AlpacaClient:
             logger.error(f"yfinance fallback failed for {symbol}: {e}")
             return None
 
+    def has_open_order(self, symbol: str) -> Optional[bool]:
+        """Return True if any open order exists for `symbol` (with or without "O:" prefix).
+
+        Used to gate the exit loop: a DAY-TIF sell submitted just after close
+        stays in `accepted` until the next session opens, reserving qty_available
+        to 0. Any further SELL gets a confusing "uncovered option contracts"
+        rejection. Pre-checking with this saves the audit log from a 1-per-minute
+        spam of rejections. Returns None on broker error so callers can decide
+        whether to fail open or skip.
+        """
+        if not self._ensure_authenticated():
+            return None
+        raw = symbol[2:] if symbol.startswith("O:") else symbol
+        try:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[raw],
+                limit=10,
+            )
+            open_orders = self.trading_client.get_orders(filter=req)
+            return bool(open_orders)
+        except Exception as e:
+            logger.warning(f"has_open_order({symbol}) check failed: {e}")
+            return None
+
     def place_order(self, symbol: str, quantity: int, side: str, order_type: str = "MKT",
                    price: Optional[float] = None, enforce: str = "GTC",
                    outside_regular_trading_hour: bool = False,
@@ -358,12 +383,23 @@ class AlpacaClient:
 
             limit_price = max(round(float(limit_price), 2), 0.01)  # Alpaca minimum
 
+            # Without an explicit position_intent, Alpaca's risk engine treats
+            # the SELL as sell_to_open (writing a naked call) and rejects with
+            # "account not eligible to trade uncovered option contracts" because
+            # the paper account doesn't carry the level for naked writing. The
+            # strategy only ever takes long calls, so BUY = open, SELL = close.
+            intent = (
+                PositionIntent.BUY_TO_OPEN
+                if alpaca_side == OrderSide.BUY
+                else PositionIntent.SELL_TO_CLOSE
+            )
             order_request = LimitOrderRequest(
                 symbol=option_symbol,
                 qty=quantity,
                 side=alpaca_side,
                 time_in_force=TimeInForce.DAY,
                 limit_price=limit_price,
+                position_intent=intent,
             )
 
             order = self.trading_client.submit_order(order_request)

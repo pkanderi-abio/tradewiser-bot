@@ -42,6 +42,8 @@ IV_RANK_MAX              = 50    # skip BUY if 30-day HV rank > 50% (options exp
 EARNINGS_DAYS_MIN        = 7     # skip BUY if earnings within this many calendar days
 TRAILING_STOP_ACTIVATION = 0.20  # arm trailing stop after +20% gain
 TRAILING_STOP_PCT        = 0.15  # trail 15% below the peak mark price
+EXIT_FAILURE_COOLDOWN_SECONDS = 300  # after a SELL rejection, skip re-attempts for this long
+                                     # (without it, every 60s loop tick = another audit-log spam row)
 
 
 # ── Technical indicator helpers ────────────────────────────────────────────────
@@ -189,13 +191,22 @@ def _parse_underlying(occ_symbol: str) -> Optional[str]:
 
 class DailyRSIStrategy:
     def __init__(self):
-        self.positions:          Dict[str, int]   = defaultdict(int)
-        self.option_symbols:     Dict[str, str]   = {}   # stock → OCC call symbol held
-        self.entry_opt_prices:   Dict[str, float] = {}   # stock → option price at entry
-        self.entry_stock_prices: Dict[str, float] = {}   # stock → stock price at entry
-        self.peak_opt_prices:    Dict[str, float] = {}   # stock → highest mark seen
-        self.signals:            Dict[str, dict]  = {}   # stock → latest signal dict
-        self.last_signal_date:   Optional[date]   = None
+        self.positions:          Dict[str, int]      = defaultdict(int)
+        self.option_symbols:     Dict[str, str]      = {}      # stock → OCC call symbol held
+        self.entry_opt_prices:   Dict[str, float]    = {}      # stock → option price at entry
+        self.entry_stock_prices: Dict[str, float]    = {}      # stock → stock price at entry
+        self.peak_opt_prices:    Dict[str, float]    = {}      # stock → highest mark seen
+        self.signals:            Dict[str, dict]     = {}      # stock → latest signal dict
+        self.last_signal_date:   Optional[date]      = None
+        # Per-stock last SELL-failure timestamp; gates the 60s monitor loop from
+        # re-firing a rejection every tick. Cleared on a successful close.
+        self.failed_exits:       Dict[str, datetime] = {}
+
+    def in_exit_cooldown(self, symbol: str) -> bool:
+        last = self.failed_exits.get(symbol)
+        if last is None:
+            return False
+        return (datetime.now(timezone.utc) - last).total_seconds() < EXIT_FAILURE_COOLDOWN_SECONDS
 
     def active_position_count(self) -> int:
         return sum(1 for q in self.positions.values() if q > 0)
@@ -261,6 +272,18 @@ class DailyRSIStrategy:
         qty = min(self.positions[symbol], TRADE_QUANTITY)
         if qty <= 0:
             return False
+        # If a prior SELL is still open at the broker (e.g. a DAY-TIF order
+        # submitted just after market close, queued for the next session),
+        # qty_available is 0 and any new SELL gets rejected as "uncovered
+        # option contracts". Defer instead of spamming the broker.
+        has_open = alpaca_client.has_open_order(call_symbol)
+        if has_open is True:
+            logger.info(
+                f"[SELL-DEFERRED] {call_symbol} for {symbol}: existing open order "
+                f"reserves position — skipping new SELL ({reason})"
+            )
+            self.failed_exits[symbol] = datetime.now(timezone.utc)
+            return False
         try:
             result = alpaca_client.place_order(
                 symbol=call_symbol, quantity=qty, side="SELL", order_type="MKT"
@@ -272,16 +295,19 @@ class DailyRSIStrategy:
                     self.entry_opt_prices.pop(symbol, None)
                     self.entry_stock_prices.pop(symbol, None)
                     self.peak_opt_prices.pop(symbol, None)
+                self.failed_exits.pop(symbol, None)
                 logger.info(f"[SELL] {call_symbol} for {symbol} | {reason}")
                 self._audit(symbol, "SELL", qty, stock_price, "submitted",
                             detail=reason, option_symbol=call_symbol)
                 return True
             broker_err = alpaca_client.last_order_error or "Alpaca rejected"
+            self.failed_exits[symbol] = datetime.now(timezone.utc)
             logger.error(f"[ERROR] SELL rejected for {symbol} ({call_symbol}): {broker_err}")
             self._audit(symbol, "SELL", qty, stock_price, "failed",
                         broker_err, call_symbol)
             return False
         except Exception as e:
+            self.failed_exits[symbol] = datetime.now(timezone.utc)
             logger.error(f"[ERROR] Sell error for {symbol}: {e}")
             self._audit(symbol, "SELL", qty, stock_price, "error", str(e), call_symbol)
             return False
@@ -326,6 +352,7 @@ class DailyRSIStrategy:
             self.entry_opt_prices.pop(stale, None)
             self.entry_stock_prices.pop(stale, None)
             self.peak_opt_prices.pop(stale, None)
+            self.failed_exits.pop(stale, None)
 
         # Adopt or refresh positions that Alpaca confirms.
         for underlying, pos in live_by_underlying.items():
@@ -541,9 +568,15 @@ async def start_trading_loop():
                         reason = reason or f"expiry in {days_left} day(s)"
 
                     if reason:
-                        logger.info(f"[EXIT] {opt_sym} ({stock_sym}): {reason}")
-                        stock_px = rsi_strategy.entry_stock_prices.get(stock_sym, 0)
-                        rsi_strategy.execute_sell(stock_sym, stock_px, reason)
+                        if rsi_strategy.in_exit_cooldown(stock_sym):
+                            logger.info(
+                                f"[EXIT-COOLDOWN] {opt_sym} ({stock_sym}): {reason} — "
+                                f"recent SELL failure, skipping until cooldown clears"
+                            )
+                        else:
+                            logger.info(f"[EXIT] {opt_sym} ({stock_sym}): {reason}")
+                            stock_px = rsi_strategy.entry_stock_prices.get(stock_sym, 0)
+                            rsi_strategy.execute_sell(stock_sym, stock_px, reason)
                     elif mark and entry:
                         gain_pct  = (mark - entry) / entry
                         prev_peak = rsi_strategy.peak_opt_prices.get(stock_sym, entry)
