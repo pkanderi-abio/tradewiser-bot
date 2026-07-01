@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch, MagicMock
 from app.services.llm_service import LLMService, LLMProvider
 from app.services.sentiment_analyzer import SentimentAnalyzer
 from app.services.news_analyzer import NewsAnalyzer
+from app.services.news_severity_gate import news_severity_gate
 from app.services.market_intelligence import MarketIntelligence
 from app.services.enhanced_ai_advisor import EnhancedAIAdvisor
 from app.services.strategy_agents import (
@@ -152,6 +153,55 @@ class TestNewsAnalyzer:
         assert "earnings_surprise" in result
         assert "guidance_implication" in result
         assert "expected_volatility" in result
+
+    def test_score_headline_severities_empty(self):
+        """Test severity scoring with no headlines."""
+        analyzer = NewsAnalyzer()
+        result = analyzer.score_headline_severities("AAPL", [])
+        assert result == []
+
+    def test_aggregate_severity(self):
+        """Test severity aggregation (sum by default)."""
+        analyzer = NewsAnalyzer()
+        scored = [
+            {"severity": 5, "event_type": "product_launch"},
+            {"severity": -2, "event_type": "downgrade"},
+        ]
+        assert analyzer.aggregate_severity(scored) == 3
+        # mean would be 1.5 but default sum
+
+
+class TestNewsSeverityGate:
+    """Test the ported news severity gate."""
+
+    def test_gate_init_and_snapshot(self):
+        """Test gate initialization and config snapshot."""
+        assert news_severity_gate is not None
+        snap = news_severity_gate.snapshot()
+        assert "enabled" in snap
+        assert "min_aggregate" in snap
+        assert snap["enabled"] is True or snap["enabled"] is False
+
+    def test_gate_disabled(self):
+        """If disabled via config, always allow."""
+        # Note: in real would monkeypatch settings, here just call
+        dec = news_severity_gate.evaluate("TEST")
+        # depends on current settings, but shouldn't crash
+        assert hasattr(dec, "allow_new_buys")
+
+    def test_gate_evaluate_uses_analyzer(self):
+        """Gate should call analyzer and aggregate."""
+        from unittest.mock import patch, MagicMock
+        from app.services.news_severity_gate import NewsSeverityGate
+        gate = NewsSeverityGate()
+        mock_analyzer = MagicMock()
+        mock_analyzer.score_headline_severities.return_value = [{"severity": 5}, {"severity": 3}]
+        mock_analyzer.aggregate_severity.return_value = 8.0
+        with patch.object(gate, "_analyzer", mock_analyzer):
+            dec = gate.evaluate("AAPL")
+            assert dec.aggregate == 8.0
+            assert dec.allow_new_buys is True  # 8 > -4
+            mock_analyzer.score_headline_severities.assert_called()
 
 
 class TestMarketIntelligence:

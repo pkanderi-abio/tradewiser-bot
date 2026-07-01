@@ -88,6 +88,49 @@ class Settings(BaseSettings):
     AI_MAX_HEADLINE_CHARS: int = Field(160, description="Per-headline character cap after sanitization")
 
     # ============================================================
+    # News Severity Scoring (ported from news-event severity experiment)
+    # Scores each headline for event_type + numeric severity (-10..+10).
+    # Aggregate feeds into AI context for better news-aware decisions.
+    # ============================================================
+    NEWS_SEVERITY_ENABLED: bool = Field(True, description="Enable per-headline LLM severity scoring (event_type + -10..+10 score)")
+    NEWS_SEVERITY_LOOKBACK_DAYS: int = Field(3, description="Window for aggregating recent headline severity scores")
+    NEWS_SEVERITY_MIN_AGGREGATE: float = Field(4.0, description="Aggregate severity threshold considered 'notable' (passed to AI for context)")
+    NEWS_SEVERITY_MAX_TO_SCORE: int = Field(15, description="Max headlines to score per symbol per call (cost control)")
+    NEWS_SEVERITY_AGGREGATE: str = Field("sum", description="Aggregation for severity scores: 'sum' (default) or 'mean'")
+    NEWS_SEVERITY_BOOST_FACTOR: float = Field(2.0, description="Factor by which positive severity aggregate lowers effective RSI for signal boosting in trading engine (higher = stronger effect)")
+
+    # ============================================================
+    # News Event Extractor (Phase 2 production service — feeds NewsEventStrategy)
+    # ============================================================
+    # Extracts {event_type, severity, confidence} per headline. Follows AI_* reliability
+    # pattern: kill switch, fail-closed, circuit breaker, cache, per-headline audit.
+    # Uses the same LLM provider chain as ai_advisor (Groq preferred, Ollama fallback).
+    NEWS_EVENT_KILL_SWITCH: bool = Field(False, description="Emergency stop — force extract() to return an empty list without hitting the LLM")
+    NEWS_EVENT_FAIL_CLOSED: bool = Field(True, description="On extractor failure, return no events (no signal). Set False only for non-live testing.")
+    NEWS_EVENT_REQUEST_TIMEOUT_SECONDS: float = Field(15.0, description="Per-batch LLM timeout")
+    NEWS_EVENT_MAX_RETRIES: int = Field(2, description="Retries after first attempt on transient LLM failures")
+    NEWS_EVENT_RETRY_BACKOFF_SECONDS: float = Field(0.75, description="Initial backoff between retries; doubles each attempt")
+    NEWS_EVENT_CIRCUIT_BREAKER_THRESHOLD: int = Field(5, description="Consecutive extractor failures before circuit opens")
+    NEWS_EVENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS: int = Field(120, description="Cooldown before a probe call is allowed")
+    NEWS_EVENT_CACHE_TTL_SECONDS: int = Field(3600, description="Per-headline extraction cache TTL")
+    NEWS_EVENT_BATCH_SIZE: int = Field(5, description="Headlines per LLM call — smaller batches give better JSON discipline")
+    NEWS_EVENT_MAX_HEADLINES_PER_CALL: int = Field(30, description="Ceiling on headlines passed to extract() per symbol per pass")
+    NEWS_EVENT_MIN_ABS_SEVERITY: int = Field(3, description="Drop events with |severity| below this threshold before aggregation")
+
+    # ============================================================
+    # NewsEvent Strategy (Phase 3+4 — multi-day event-driven positions)
+    # ============================================================
+    NEWS_STRATEGY_ENABLED: bool = Field(False, description="Master switch. Off by default: strategy code exists but doesn't trade until manually enabled after paper-observation.")
+    NEWS_STRATEGY_MAX_CONCURRENT: int = Field(3, description="Max concurrent open positions across all NewsEventStrategy instruments")
+    NEWS_STRATEGY_SEVERITY_MIN_TO_ENTER: float = Field(4.0, description="Aggregate severity (per NEWS_SEVERITY_AGGREGATE) required to enter a new position")
+    NEWS_STRATEGY_SEVERITY_MIN_OPTIONS: float = Field(7.0, description="Aggregate severity at/above which to route to ATM call options (leveraged conviction). Below this + above ENTER threshold => stock.")
+    NEWS_STRATEGY_HOLD_DAYS: int = Field(5, description="Max trading sessions to hold a news-driven position before time-stop")
+    NEWS_STRATEGY_STOP_LOSS_PCT: float = Field(0.08, description="Percent drop from entry that triggers a stop-loss exit")
+    NEWS_STRATEGY_TAKE_PROFIT_PCT: float = Field(0.15, description="Percent gain from entry that triggers a take-profit exit")
+    NEWS_STRATEGY_REVERSAL_SEVERITY_MULT: float = Field(-0.75, description="Exit if new aggregate severity has opposite sign and |severity| exceeds |entry severity| * this multiplier (e.g. entry +6, exit if new aggregate <= -4.5)")
+    NEWS_STRATEGY_POSITION_DOLLARS: float = Field(1000.0, description="Notional target per news-strategy position (equal-weight sizing v1)")
+
+    # ============================================================
     # Multi-model Ensemble — Stage-1 screen (cheap/fast) → Stage-2 confirm (smart)
     # ============================================================
     ENSEMBLE_ENABLED: bool = Field(True, description="Send borderline / high-stakes BUYs through a smart-model second opinion when an Anthropic or OpenAI key is configured")

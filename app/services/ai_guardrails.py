@@ -41,6 +41,50 @@ class AIDecision(BaseModel):
         return str(v)[:200]
 
 
+# Event taxonomy — kept as a top-level tuple so the extractor's prompt, the
+# audit schema, and any downstream analytics all reference the same source of
+# truth. Values must exactly match the LLM's expected output strings.
+NEWS_EVENT_TYPES = (
+    "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
+    "upgrade", "downgrade", "ma_rumor", "fda_approval", "fda_rejection",
+    "lawsuit", "recall", "partnership", "product_launch", "macro", "other",
+)
+
+
+class NewsEvent(BaseModel):
+    """One extracted event from a single headline.
+
+    The extractor's LLM response must be a JSON list; each item is validated
+    against this schema. Invalid items are dropped (not fail-open) — the
+    caller receives the subset that validated cleanly. If the list itself is
+    malformed, the entire batch fails and the fail-closed policy applies.
+    """
+    event_type: Literal[
+        "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
+        "upgrade", "downgrade", "ma_rumor", "fda_approval", "fda_rejection",
+        "lawsuit", "recall", "partnership", "product_launch", "macro", "other",
+    ]
+    severity: int = Field(ge=-10, le=10)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(default="", max_length=200)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _coerce_reason(cls, v):
+        if v is None:
+            return ""
+        return str(v)[:200]
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _coerce_severity(cls, v):
+        # Accept float severities from the LLM (some models emit "8.0")
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return 0
+
+
 # ── Prompt-injection sanitization ──────────────────────────────────────────────
 
 # Patterns that look like attempts to subvert the system prompt when included
@@ -152,6 +196,8 @@ class CircuitBreaker:
 
 __all__ = [
     "AIDecision",
+    "NewsEvent",
+    "NEWS_EVENT_TYPES",
     "ValidationError",
     "sanitize_headline",
     "sanitize_headlines",

@@ -292,6 +292,73 @@ try {
 }
 
 # ---------------------------------------------------------------------------
+# 8. NewsEventStrategy (Phase 2-6 news-driven multi-day strategy)
+# ---------------------------------------------------------------------------
+Write-Section "8. NewsEventStrategy (news-driven multi-day)"
+
+$news = Invoke-BotApi "/trades/news-strategy?window_days=30"
+if ($null -eq $news) {
+    Write-Warn "News strategy" "Unavailable (endpoint not responding)"
+} else {
+    $s = $news.strategy
+    $x = $news.extractor
+    $c = $news.calibration
+
+    if ($s.enabled) {
+        Write-OK "Feature flag" "ENABLED"
+    } else {
+        Write-Warn "Feature flag" "DISABLED (exits still evaluated on legacy positions)"
+        Write-Hint "Set NEWS_STRATEGY_ENABLED=true in .env to allow new entries"
+    }
+
+    Write-OK "LLM provider" "$($x.provider) / $($x.model)"
+    if ($x.kill_switch) {
+        Write-Warn "Kill switch" "ACTIVE - extractor returning empty"
+    }
+    if ($x.circuit.state -ne "closed") {
+        Write-Warn "Extractor circuit" "$($x.circuit.state) (consecutive_failures=$($x.circuit.consecutive_failures))"
+    }
+
+    Write-OK "Entry threshold"    "sev >= $($s.min_severity_to_enter) (stock) | sev >= $($s.min_severity_for_options) (options)"
+    Write-OK "Exits"               "-$([math]::Round($s.stop_pct*100,1))% stop | +$([math]::Round($s.target_pct*100,1))% target | $($s.hold_days)d time"
+    Write-OK "Concurrent slots"    "max $($s.max_concurrent)"
+
+    # Open positions
+    Write-Host ""
+    Write-Host "  Open news-strategy positions:" -ForegroundColor DarkGray
+    if ($news.open_positions -and $news.open_positions.Count -gt 0) {
+        $hdr = "    {0,-24} {1,-6} {2,-8} {3,7}  {4,7}  {5,-8} {6,-12} {7}" -f "Symbol","Inst","State","Entry","Shares","Hold-until","Event","Sev"
+        Write-Host $hdr -ForegroundColor DarkGray
+        Write-Host "    $('-' * 90)" -ForegroundColor DarkGray
+        foreach ($p in $news.open_positions) {
+            $entry = if ($p.entry_price) { "{0:N2}" -f $p.entry_price } else { "-" }
+            $shares = if ($p.shares) { $p.shares } else { "-" }
+            $sev = if ($null -ne $p.entry_severity) { "{0:N1}" -f $p.entry_severity } else { "-" }
+            $col = if ($p.state -eq "open") { "Green" } else { "Yellow" }
+            $row = "    {0,-24} {1,-6} {2,-8} {3,7}  {4,7}  {5,-8} {6,-12} {7}" -f `
+                $p.symbol, $p.instrument, $p.state, $entry, $shares, $p.hold_until, $p.entry_event_type, $sev
+            Write-Host $row -ForegroundColor $col
+        }
+    } else {
+        Write-Host "    (no open news-strategy positions)" -ForegroundColor DarkGray
+    }
+
+    # 30-day calibration snapshot
+    Write-Host ""
+    Write-Host "  30-day calibration:" -ForegroundColor DarkGray
+    $pnlStr = if ($c.total_realized_pnl -ge 0) { "+`$$([math]::Round($c.total_realized_pnl,2))" } else { "`$$([math]::Round($c.total_realized_pnl,2))" }
+    $pnlCol = if ($c.total_realized_pnl -ge 0) { "Green" } else { "Red" }
+    Write-Host "    Closed positions : $($c.n_positions_closed)" -ForegroundColor White
+    Write-Host "    Hit rate         : $([math]::Round($c.hit_rate*100,1))%" -ForegroundColor White
+    Write-Host "    Total P&L        : $pnlStr" -ForegroundColor $pnlCol
+    Write-Host "    Mean % return    : $([math]::Round($c.mean_pct_return*100,2))%" -ForegroundColor White
+    Write-Host "    Events scored    : $($c.total_events) (error rate $([math]::Round($c.error_rate_events*100,1))%)" -ForegroundColor DarkGray
+    foreach ($note in $c.notes) {
+        Write-Host "    ! $note" -ForegroundColor Yellow
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 $apiOk = ($health -and $health.status -eq "ok")

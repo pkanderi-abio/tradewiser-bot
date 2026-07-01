@@ -97,6 +97,24 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS headline_scores (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            headline_hash  TEXT NOT NULL,
+            symbol         TEXT NOT NULL,
+            event_type     TEXT,
+            severity       INTEGER,
+            confidence     REAL,
+            reason         TEXT,
+            model          TEXT,
+            timestamp      TEXT NOT NULL,
+            UNIQUE(headline_hash)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_headline_scores_symbol ON headline_scores(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_headline_scores_ts ON headline_scores(timestamp)")
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS risk_events (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp       TEXT NOT NULL,
@@ -121,6 +139,70 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # news_events: audit log for the Phase 2 news_event_extractor. Append-only,
+    # one row per extraction attempt including failures. Distinct from
+    # headline_scores (which is a lightweight cache table upserted by hash).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_events (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp         TEXT NOT NULL,
+            symbol            TEXT NOT NULL,
+            headline_hash     TEXT NOT NULL,
+            headline          TEXT NOT NULL,
+            source            TEXT,
+            published_at      TEXT,
+            event_type        TEXT NOT NULL,
+            severity          INTEGER NOT NULL,
+            confidence        REAL NOT NULL,
+            reason            TEXT,
+            provider          TEXT NOT NULL,
+            model             TEXT NOT NULL,
+            prompt_hash       TEXT,
+            latency_ms        INTEGER,
+            attempts          INTEGER,
+            circuit_state     TEXT,
+            outcome           TEXT NOT NULL,
+            error             TEXT,
+            prompt_tokens     INTEGER,
+            completion_tokens INTEGER
+        )
+        """
+    )
+    # multi_day_positions: Phase 3 state store for the NewsEventStrategy.
+    # State machine: 'pending' (BUY order submitted, awaiting fill) ->
+    #   'open' (filled, tracking exits) -> 'closed' (exited).
+    # Exit reasons: 'stop' | 'target' | 'time' | 'reversal' | 'manual' | 'error'.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS multi_day_positions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy          TEXT NOT NULL,
+            symbol            TEXT NOT NULL,
+            underlying        TEXT NOT NULL,
+            instrument        TEXT NOT NULL,
+            state             TEXT NOT NULL,
+            entry_signal_at   TEXT NOT NULL,
+            entry_order_id    TEXT,
+            entry_filled_at   TEXT,
+            entry_price       REAL,
+            shares            INTEGER,
+            stop_level        REAL,
+            target_level      REAL,
+            hold_until        TEXT,
+            entry_severity    REAL,
+            entry_event_type  TEXT,
+            entry_reason      TEXT,
+            exit_order_id     TEXT,
+            exit_filled_at    TEXT,
+            exit_price        REAL,
+            exit_reason       TEXT,
+            realized_pnl      REAL,
+            last_updated_at   TEXT NOT NULL,
+            payload           TEXT
+        )
+        """
+    )
     # Idempotent migrations for old DBs created before token columns existed.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_decisions)").fetchall()}
     if "prompt_tokens" not in cols:
@@ -135,6 +217,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_decisions_symbol ON ai_decisions(symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_events_ts ON risk_events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts ON account_snapshots(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_events_ts ON news_events(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_events_symbol ON news_events(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_events_hash ON news_events(headline_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mdp_state ON multi_day_positions(state)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mdp_underlying ON multi_day_positions(underlying)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mdp_strategy ON multi_day_positions(strategy)")
 
 
 # ── trade_audit (legacy public API) ────────────────────────────────────────────
@@ -221,6 +309,50 @@ def record_ai_decision(entry: Dict[str, Any]) -> int:
             ),
         )
         return cur.lastrowid
+
+
+def record_headline_score(symbol: str, score: Dict[str, Any]) -> None:
+    """Persist a scored headline (idempotent via hash).
+
+    score must have: headline_hash, event_type, severity, confidence, reason, model (opt)
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    h = score["headline_hash"]
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO headline_scores
+            (headline_hash, symbol, event_type, severity, confidence, reason, model, timestamp)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                h,
+                symbol.upper(),
+                score.get("event_type"),
+                int(score.get("severity", 0)),
+                float(score.get("confidence", 0.5)),
+                score.get("reason"),
+                score.get("model"),
+                ts,
+            ),
+        )
+
+
+def get_headline_scores(symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    with _lock:
+        conn = _connect()
+        if symbol:
+            rows = conn.execute(
+                "SELECT * FROM headline_scores WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?",
+                (symbol.upper(), limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM headline_scores ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def record_risk_event(entry: Dict[str, Any]) -> int:
@@ -417,9 +549,153 @@ def reset_for_tests() -> None:
 
 def truncate_tables_for_tests(*tables: str) -> None:
     """Clear specific tables — test-only helper. No-op for unknown table names."""
-    allowed = {"trade_audit", "ai_decisions", "risk_events", "account_snapshots"}
+    allowed = {"trade_audit", "ai_decisions", "risk_events", "account_snapshots",
+               "headline_scores", "news_events", "multi_day_positions"}
     with _lock:
         conn = _connect()
         for t in tables:
             if t in allowed:
                 conn.execute(f"DELETE FROM {t}")
+
+
+# ── news_events (Phase 2 news event extractor audit) ─────────────────────────
+
+def record_news_event(entry: Dict[str, Any]) -> int:
+    """Persist one extraction attempt (success or failure).
+
+    Required keys: symbol, headline_hash, headline, event_type, severity,
+                   confidence, provider, model, outcome.
+    Optional: source, published_at, reason, prompt_hash, latency_ms, attempts,
+              circuit_state, error, prompt_tokens, completion_tokens.
+
+    Outcomes are aligned with ai_decisions vocabulary so downstream dashboards
+    can share query logic: 'ok', 'llm_error', 'timeout', 'schema_error',
+    'circuit_open', 'kill_switch', 'cache_hit'.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            """
+            INSERT INTO news_events
+                (timestamp, symbol, headline_hash, headline, source, published_at,
+                 event_type, severity, confidence, reason,
+                 provider, model, prompt_hash, latency_ms, attempts,
+                 circuit_state, outcome, error, prompt_tokens, completion_tokens)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                timestamp,
+                entry["symbol"].upper(),
+                entry["headline_hash"],
+                entry["headline"][:500],
+                entry.get("source"),
+                entry.get("published_at"),
+                entry["event_type"],
+                int(entry["severity"]),
+                float(entry["confidence"]),
+                (entry.get("reason") or "")[:200],
+                entry["provider"],
+                entry["model"],
+                entry.get("prompt_hash"),
+                entry.get("latency_ms"),
+                entry.get("attempts"),
+                entry.get("circuit_state"),
+                entry["outcome"],
+                entry.get("error"),
+                entry.get("prompt_tokens"),
+                entry.get("completion_tokens"),
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_news_events(limit: int = 100, symbol: Optional[str] = None,
+                    outcome: Optional[str] = "ok") -> List[Dict[str, Any]]:
+    """Return recent extractions. Default filters to outcome='ok' for signal queries."""
+    with _lock:
+        conn = _connect()
+        clauses = []
+        args: List[Any] = []
+        if symbol:
+            clauses.append("symbol = ?"); args.append(symbol.upper())
+        if outcome:
+            clauses.append("outcome = ?"); args.append(outcome)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        args.append(max(1, int(limit)))
+        rows = conn.execute(
+            f"SELECT * FROM news_events {where} ORDER BY id DESC LIMIT ?",
+            args,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_news_event_by_hash(headline_hash: str) -> Optional[Dict[str, Any]]:
+    """Most recent successful extraction for a given headline_hash (cache lookahead)."""
+    with _lock:
+        conn = _connect()
+        row = conn.execute(
+            """
+            SELECT * FROM news_events
+            WHERE headline_hash = ? AND outcome = 'ok'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (headline_hash,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def news_event_stats(window_minutes: int = 1440) -> Dict[str, Any]:
+    """Rollup of extractor health + volume — for /trades/news-event-status."""
+    with _lock:
+        conn = _connect()
+        overall = conn.execute(
+            """
+            SELECT COUNT(*) AS n,
+                   COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+                   COALESCE(AVG(latency_ms),0) AS avg_latency_ms
+            FROM news_events
+            WHERE timestamp >= datetime('now', ?)
+              AND outcome = 'ok'
+            """,
+            (f"-{int(window_minutes)} minutes",),
+        ).fetchone()
+        by_outcome = conn.execute(
+            """
+            SELECT outcome, COUNT(*) AS n
+            FROM news_events
+            WHERE timestamp >= datetime('now', ?)
+            GROUP BY outcome
+            """,
+            (f"-{int(window_minutes)} minutes",),
+        ).fetchall()
+        by_type = conn.execute(
+            """
+            SELECT event_type, COUNT(*) AS n, COALESCE(AVG(severity),0) AS mean_severity
+            FROM news_events
+            WHERE timestamp >= datetime('now', ?)
+              AND outcome = 'ok'
+            GROUP BY event_type
+            ORDER BY n DESC
+            LIMIT 20
+            """,
+            (f"-{int(window_minutes)} minutes",),
+        ).fetchall()
+    outcome_counts = {r["outcome"]: r["n"] for r in by_outcome}
+    total_attempts = sum(outcome_counts.values())
+    fail_bucket = (outcome_counts.get("llm_error", 0)
+                   + outcome_counts.get("timeout", 0)
+                   + outcome_counts.get("schema_error", 0)
+                   + outcome_counts.get("circuit_open", 0))
+    return {
+        "window_minutes": window_minutes,
+        "total_ok": overall["n"] if overall else 0,
+        "total_attempts": total_attempts,
+        "by_outcome": outcome_counts,
+        "error_rate": round(fail_bucket / total_attempts, 3) if total_attempts else 0.0,
+        "total_prompt_tokens": int(overall["prompt_tokens"]) if overall else 0,
+        "total_completion_tokens": int(overall["completion_tokens"]) if overall else 0,
+        "avg_latency_ms": round(float(overall["avg_latency_ms"] or 0), 1) if overall else 0.0,
+        "by_event_type": [dict(r) for r in by_type],
+    }

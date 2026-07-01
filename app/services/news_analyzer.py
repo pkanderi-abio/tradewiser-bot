@@ -16,6 +16,12 @@ from datetime import datetime, timedelta
 from app.core.config import settings
 from app.core.logger import logger
 from app.services.llm_service import LLMService
+from app.services.ai_guardrails import sanitize_headlines
+from app.services.utils import record_headline_score, get_headline_scores
+
+import hashlib
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class NewsAnalyzer:
@@ -378,3 +384,185 @@ Focus on trading relevance."""
                 "conviction_level": 0.0,
                 "error": str(e),
             }
+
+    # ============================================================
+    # News Severity Scoring (ported + hardened from news-event experiment)
+    # ============================================================
+
+    VALID_EVENT_TYPES = {
+        "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
+        "upgrade", "downgrade", "ma_rumor", "fda_approval", "fda_rejection",
+        "lawsuit", "recall", "partnership", "product_launch", "macro", "other",
+    }
+
+    def _headline_hash(self, h: str) -> str:
+        return hashlib.sha256(h.encode("utf-8")).hexdigest()[:32]
+
+    def score_headline_severities(
+        self,
+        symbol: str,
+        headlines: List[str],
+    ) -> List[dict]:
+        """
+        Score recent headlines for event type and numeric severity.
+
+        Returns list of:
+            {
+                "headline": str (sanitized),
+                "event_type": str (from VALID_EVENT_TYPES),
+                "severity": int -10..+10,
+                "confidence": float 0..1,
+                "reason": str,
+            }
+
+        Uses LLM (via LLMService) with sanitize, clamping, robust parse.
+        Cached in-memory by headline hash for the analyzer instance.
+        """
+        if not headlines or not getattr(settings, "NEWS_SEVERITY_ENABLED", True):
+            return []
+
+        # Sanitize first (prompt injection defense)
+        clean = sanitize_headlines(
+            headlines,
+            max_count=getattr(settings, "NEWS_SEVERITY_MAX_TO_SCORE", 15),
+            max_chars=200,
+        )
+        if not clean:
+            return []
+
+        # Persistent DB cache for headline scores (port from experiment)
+        db_cached = {}
+        for row in get_headline_scores(symbol, limit=200):
+            if row.get("headline_hash"):
+                db_cached[row["headline_hash"]] = row
+
+        prefilled = []
+        remaining = []
+        for h in clean:
+            hh = self._headline_hash(h)
+            if hh in db_cached:
+                r = db_cached[hh]
+                prefilled.append({
+                    "headline": h,
+                    "event_type": r.get("event_type", "other"),
+                    "severity": int(r.get("severity", 0)),
+                    "confidence": float(r.get("confidence", 0.5)),
+                    "reason": r.get("reason", ""),
+                })
+            else:
+                remaining.append(h)
+
+        if not remaining:
+            return prefilled
+
+        clean = remaining
+
+        # In-memory + LLM cache
+        content_hash = self._headline_hash("||".join(clean))
+        cache_key = f"severity_{symbol}_{content_hash}"
+        if hasattr(self, "_sev_cache") and cache_key in getattr(self, "_sev_cache", {}):
+            ts, res = self._sev_cache[cache_key]
+            if time.time() - ts < 3600:
+                return prefilled + res
+
+        if not hasattr(self, "_sev_cache"):
+            self._sev_cache: Dict[str, Tuple[float, List[dict]]] = {}
+
+        # Sample prompt for severity scoring (ported + hardened from news-event experiment).
+        # This is the exact template used for LLM calls to produce structured {event_type, severity} scores.
+        # Feel free to evolve it; keep JSON-only output requirement for robust parsing.
+        SEVERITY_SCORING_PROMPT_TEMPLATE = f"""You are a financial news analyst scoring headline impact for {symbol}.
+
+For EACH headline below, assign:
+- event_type: exactly one of {sorted(self.VALID_EVENT_TYPES)}
+- severity: integer from -10 (strongly bearish) to +10 (strongly bullish)
+- confidence: 0.0 to 1.0
+- reason: 1 short sentence
+
+Return ONLY a JSON array of objects (no other text, no ```):
+[
+  {{"headline": "original headline", "event_type": "...", "severity": 5, "confidence": 0.8, "reason": "..." }},
+  ...
+]
+
+Headlines:
+{json.dumps(clean, ensure_ascii=False)}
+
+Clamp severity to [-10,10]. If unclear use event_type="other", severity=0."""
+
+        prompt = SEVERITY_SCORING_PROMPT_TEMPLATE
+
+        try:
+            response = self.llm.query(
+                prompt,
+                system_prompt="Respond with strict JSON array only. Be objective and consistent.",
+                temperature=0.1,
+                max_tokens=1500,
+                cache_key=cache_key,
+            )
+            data = self.llm.parse_json_response(response)
+            if isinstance(data, dict):
+                data = data.get("scores") or data.get("results") or list(data.values())[0] if data else []
+            if not isinstance(data, list):
+                data = []
+
+            results: List[dict] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                hl = str(item.get("headline", ""))[:200]
+                et = str(item.get("event_type", "other")).lower().replace(" ", "_")
+                if et not in self.VALID_EVENT_TYPES:
+                    et = "other"
+                try:
+                    sev = int(item.get("severity", 0))
+                except Exception:
+                    sev = 0
+                sev = max(-10, min(10, sev))
+                try:
+                    conf = float(item.get("confidence", 0.5))
+                except Exception:
+                    conf = 0.5
+                conf = max(0.0, min(1.0, conf))
+                reason = str(item.get("reason", ""))[:120]
+                results.append({
+                    "headline": hl,
+                    "event_type": et,
+                    "severity": sev,
+                    "confidence": round(conf, 2),
+                    "reason": reason,
+                })
+
+                # Persist to DB for cross-run cache (idempotent)
+                try:
+                    record_headline_score(symbol, {
+                        "headline_hash": self._headline_hash(hl),
+                        "event_type": et,
+                        "severity": sev,
+                        "confidence": conf,
+                        "reason": reason,
+                        "model": getattr(self.llm, "_model", None),
+                    })
+                except Exception:
+                    pass
+
+            full_results = prefilled + results
+            self._sev_cache[cache_key] = (time.time(), results)
+            return full_results
+        except Exception as e:
+            logger.warning(f"[news_analyzer] severity scoring failed for {symbol}: {e}")
+            return []
+
+    def aggregate_severity(
+        self,
+        scored: List[dict],
+        lookback_days: Optional[int] = None,
+    ) -> float:
+        """Aggregate using config (sum or mean)."""
+        if not scored:
+            return 0.0
+        agg = getattr(settings, "NEWS_SEVERITY_AGGREGATE", "sum").lower()
+        sevs = [float(s.get("severity", 0)) for s in scored]
+        if agg in ("mean", "avg", "average"):
+            return sum(sevs) / max(1, len(sevs))
+        return sum(sevs)
