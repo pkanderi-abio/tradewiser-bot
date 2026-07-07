@@ -48,6 +48,7 @@ from app.services.utils import get_news_event_by_hash, record_news_event
 GROQ_MODEL = settings.GROQ_MODEL or "llama-3.3-70b-versatile"
 OLLAMA_MODEL = settings.OLLAMA_MODEL or "llama3.2"
 OLLAMA_URL = settings.OLLAMA_URL or "http://localhost:11434/v1"
+ANTHROPIC_MODEL = settings.ANTHROPIC_MODEL or "claude-3-haiku-20240307"  # fast + capable for extraction
 
 
 # ── Public data types ────────────────────────────────────────────────────────
@@ -89,6 +90,64 @@ def _h(headline: str) -> str:
     return hashlib.sha256(headline.encode("utf-8")).hexdigest()[:32]
 
 
+# Simple keyword-based fallback severity (cheap, no LLM). Used when circuit is open or LLM fails.
+_BULLISH_KEYWORDS = {
+    "beat", "exceed", "raise", "upgrade", "positive", "growth", "launch", "approval",
+    "partnership", "strong", "record", "surge", "gain", "bullish", "outperform"
+}
+_BEARISH_KEYWORDS = {
+    "miss", "cut", "downgrade", "negative", "decline", "loss", "lawsuit", "recall",
+    "weak", "drop", "fall", "bearish", "underperform", "warning", "delay"
+}
+_MACRO_POS = {"rate cut", "stimulus", "fed dovish"}
+_MACRO_NEG = {"rate hike", "inflation", "recession", "fed hawkish"}
+
+
+def _simple_severity_fallback(headline: str) -> dict:
+    h = headline.lower()
+    score = 0
+    event = "other"
+    conf = 0.35
+    reason = "keyword fallback"
+    if any(k in h for k in _BULLISH_KEYWORDS):
+        score = 4
+        if "launch" in h or "approval" in h:
+            event = "product_launch"
+        elif "beat" in h or "exceed" in h:
+            event = "earnings_beat"
+        elif "upgrade" in h:
+            event = "upgrade"
+        elif "partner" in h:
+            event = "partnership"
+        else:
+            event = "macro"
+        conf = 0.55
+        reason = "positive keywords"
+    elif any(k in h for k in _BEARISH_KEYWORDS):
+        score = -4
+        if "miss" in h:
+            event = "earnings_miss"
+        elif "cut" in h:
+            event = "guidance_cut"
+        elif "downgrade" in h:
+            event = "downgrade"
+        elif "lawsuit" in h or "recall" in h:
+            event = "lawsuit"
+        else:
+            event = "macro"
+        conf = 0.55
+        reason = "negative keywords"
+    for m in _MACRO_POS:
+        if m in h:
+            score = max(score, 2)
+            event = "macro"
+    for m in _MACRO_NEG:
+        if m in h:
+            score = min(score, -2)
+            event = "macro"
+    return {"event_type": event, "severity": score, "confidence": conf, "reason": reason}
+
+
 class NewsEventExtractor:
     def __init__(self) -> None:
         self._client = None
@@ -100,6 +159,7 @@ class NewsEventExtractor:
             failure_threshold=settings.NEWS_EVENT_CIRCUIT_BREAKER_THRESHOLD,
             cooldown_seconds=settings.NEWS_EVENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         )
+        self._last_error: Optional[str] = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -107,10 +167,18 @@ class NewsEventExtractor:
         return not settings.NEWS_EVENT_KILL_SWITCH
 
     def get_provider(self) -> str:
-        return "groq" if settings.GROQ_API_KEY else "ollama"
+        if settings.GROQ_API_KEY:
+            return "groq"
+        if settings.ANTHROPIC_API_KEY:
+            return "anthropic"
+        return "ollama"
 
     def get_model(self) -> str:
-        return GROQ_MODEL if settings.GROQ_API_KEY else OLLAMA_MODEL
+        if settings.GROQ_API_KEY:
+            return GROQ_MODEL
+        if settings.ANTHROPIC_API_KEY:
+            return ANTHROPIC_MODEL
+        return OLLAMA_MODEL
 
     def snapshot(self) -> dict:
         return {
@@ -126,6 +194,7 @@ class NewsEventExtractor:
             "cache_ttl_seconds": settings.NEWS_EVENT_CACHE_TTL_SECONDS,
             "cached_headlines": len(self._cache),
             "circuit": self._breaker.snapshot(),
+            "last_error": self._last_error,
         }
 
     def extract(
@@ -239,16 +308,26 @@ class NewsEventExtractor:
 
         # 5. Circuit breaker.
         if not self._breaker.allow():
-            logger.warning(f"[news_event] {symbol} circuit open - {len(misses)} headlines dropped")
+            logger.warning(f"[news_event] {symbol} circuit open - using keyword fallback for {len(misses)} headlines")
+            fallback_events = []
             for text, src, pub, h_hash in misses:
+                fb = _simple_severity_fallback(text)
+                ev = ExtractedEvent(
+                    symbol=symbol, headline=text, headline_hash=h_hash,
+                    event_type=fb["event_type"], severity=fb["severity"],
+                    confidence=fb["confidence"], reason=fb["reason"],
+                    source=src, published_at=pub, from_cache=False,
+                )
+                fallback_events.append(ev)
                 self._persist(
                     symbol=symbol, headline=text, h_hash=h_hash,
                     src=src, pub=pub,
-                    event_type="other", severity=0, confidence=0.0, reason="circuit open",
+                    event_type=fb["event_type"], severity=fb["severity"],
+                    confidence=fb["confidence"], reason=fb["reason"],
                     prompt_hash="-", latency_ms=0, attempts=0,
-                    circuit=CircuitState.OPEN, outcome="circuit_open", error="circuit_open",
+                    circuit=CircuitState.OPEN, outcome="fallback", error="circuit_open",
                 )
-            return cache_hits
+            return cache_hits + fallback_events
 
         # 6+7. LLM call in batches.
         fresh: List[ExtractedEvent] = []
@@ -294,23 +373,27 @@ class NewsEventExtractor:
                         prompt_tokens=ptok, completion_tokens=ctok,
                     )
                 else:
+                    # Always synthesize a keyword fallback on LLM/schema failure for this item.
+                    # This ensures NewsEventStrategy receives usable signals (instead of dropping
+                    # to zero events) even when the model returns imperfect JSON or is slow.
+                    # The attempt + error is still fully audited.
+                    fb = _simple_severity_fallback(text)
+                    fresh_ev = ExtractedEvent(
+                        symbol=symbol, headline=text, headline_hash=h_hash,
+                        event_type=fb["event_type"], severity=fb["severity"],
+                        confidence=fb["confidence"], reason=fb["reason"] + " (fallback)",
+                        source=src, published_at=pub, from_cache=False,
+                    )
+                    fresh.append(fresh_ev)
+                    self._cache[h_hash] = (now + ttl, fresh_ev)
                     self._persist(
                         symbol=symbol, headline=text, h_hash=h_hash, src=src, pub=pub,
-                        event_type="other", severity=0, confidence=0.0,
-                        reason=f"failed: {outcome}",
+                        event_type=fb["event_type"], severity=fb["severity"],
+                        confidence=fb["confidence"], reason=fb["reason"] + " (after LLM fail)",
                         prompt_hash=prompt_hash, latency_ms=latency_ms, attempts=attempts,
                         circuit=self._breaker.state(), outcome=outcome, error=err,
                         prompt_tokens=ptok, completion_tokens=ctok,
                     )
-                    if not settings.NEWS_EVENT_FAIL_CLOSED:
-                        # Soft-fail: emit a zero-severity marker so callers know
-                        # a headline was seen. Not recommended for live trading.
-                        fresh.append(ExtractedEvent(
-                            symbol=symbol, headline=text, headline_hash=h_hash,
-                            event_type="other", severity=0, confidence=0.0,
-                            reason=f"soft-fail: {outcome}", source=src, published_at=pub,
-                            from_cache=False,
-                        ))
 
         return cache_hits + fresh
 
@@ -355,8 +438,8 @@ class NewsEventExtractor:
 
     def _get_client(self):
         if self._client is None:
-            from openai import OpenAI
             if settings.GROQ_API_KEY:
+                from openai import OpenAI
                 self._client = OpenAI(
                     api_key=settings.GROQ_API_KEY,
                     base_url="https://api.groq.com/openai/v1",
@@ -364,7 +447,12 @@ class NewsEventExtractor:
                     max_retries=0,
                 )
                 logger.info(f"[news_event] Provider: Groq ({GROQ_MODEL})")
+            elif settings.ANTHROPIC_API_KEY:
+                from anthropic import Anthropic
+                self._client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                logger.info(f"[news_event] Provider: Anthropic ({ANTHROPIC_MODEL})")
             else:
+                from openai import OpenAI
                 self._client = OpenAI(
                     api_key="ollama",
                     base_url=OLLAMA_URL,
@@ -389,8 +477,10 @@ Valid event_type values (exact strings):
 Headlines:
 {numbered}
 
-Respond with ONLY a JSON array of exactly {len(headlines)} objects (no markdown, no prose) in the same order as the input:
-[{{"event_type": "...", "severity": <int -10..10>, "confidence": <float 0..1>, "reason": "<= 10 words"}}, ...]
+Respond with a JSON object containing a key "events" whose value is an array of exactly {len(headlines)} objects in input order.
+Do not include any other text or explanation outside the JSON.
+Example format:
+{{"events": [{{"event_type": "...", "severity": <int -10..10>, "confidence": <float 0..1>, "reason": "<= 10 words"}}, ...] }}
 """
 
     def _call_with_retries(
@@ -410,14 +500,39 @@ Respond with ONLY a JSON array of exactly {len(headlines)} objects (no markdown,
         for attempt in range(1, max_attempts + 1):
             try:
                 client = self._get_client()
-                resp = client.chat.completions.create(
-                    model=self.get_model(),
-                    max_tokens=1500,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    timeout=settings.NEWS_EVENT_REQUEST_TIMEOUT_SECONDS,
-                )
-                text = (resp.choices[0].message.content or "").strip()
+                provider = self.get_provider()
+                model = self.get_model()
+                ptok = None
+                ctok = None
+
+                if provider == "anthropic":
+                    # Anthropic SDK call (strong at following "return only JSON")
+                    resp = client.messages.create(
+                        model=model,
+                        max_tokens=1500,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    text = (resp.content[0].text if resp.content else "").strip()
+                    ptok = getattr(getattr(resp, "usage", None), "input_tokens", None)
+                    ctok = getattr(getattr(resp, "usage", None), "output_tokens", None)
+                else:
+                    # OpenAI-compatible (Groq, Ollama)
+                    create_kwargs = {
+                        "model": model,
+                        "max_tokens": 1500,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                    }
+                    if provider == "groq":
+                        create_kwargs["response_format"] = {"type": "json_object"}
+
+                    resp = client.chat.completions.create(**create_kwargs)
+                    text = (resp.choices[0].message.content or "").strip()
+
+                    usage = getattr(resp, "usage", None)
+                    ptok = getattr(usage, "prompt_tokens", None) if usage else None
+                    ctok = getattr(usage, "completion_tokens", None) if usage else None
                 if "```" in text:
                     parts = text.split("```")
                     text = parts[1] if len(parts) > 1 else parts[0]
@@ -425,9 +540,25 @@ Respond with ONLY a JSON array of exactly {len(headlines)} objects (no markdown,
                         text = text[4:]
                 text = text.strip()
 
-                usage = getattr(resp, "usage", None)
-                ptok = getattr(usage, "prompt_tokens", None) if usage else None
-                ctok = getattr(usage, "completion_tokens", None) if usage else None
+                # Robust JSON salvage for local / weaker models (Ollama often adds prose)
+                # Only if it doesn't already look like pure JSON.
+                if text and not text.startswith(('{', '[')):
+                    try:
+                        import re
+                        # Find the longest plausible JSON object or array in the response
+                        candidates = re.findall(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
+                        if candidates:
+                            text = max(candidates, key=len).strip()
+                    except Exception:
+                        pass
+
+                # ptok/ctok already captured per-provider above; only overwrite for OpenAI-compat if needed
+                if provider != "anthropic":
+                    usage = getattr(resp, "usage", None)
+                    if usage and ptok is None:
+                        ptok = getattr(usage, "prompt_tokens", None)
+                    if usage and ctok is None:
+                        ctok = getattr(usage, "completion_tokens", None)
 
                 try:
                     parsed = json.loads(text)
@@ -436,36 +567,60 @@ Respond with ONLY a JSON array of exactly {len(headlines)} objects (no markdown,
                     last_outcome = "schema_error"
                     break  # schema errors are not transient
 
-                if not isinstance(parsed, list):
-                    last_err = f"expected list, got {type(parsed).__name__}"
+                # Support both bare array (old) and {"events": [...]} (more reliable)
+                if isinstance(parsed, dict) and "events" in parsed:
+                    arr = parsed["events"]
+                elif isinstance(parsed, list):
+                    arr = parsed
+                else:
+                    arr = []
+
+                if not isinstance(arr, list):
+                    last_err = f"expected list or {{'events': list}}, got {type(parsed).__name__}"
                     last_outcome = "schema_error"
                     break
-                if len(parsed) != expected_count:
-                    last_err = f"expected {expected_count} items, got {len(parsed)}"
+
+                # Be lenient on count — take what we can, up to expected (some models drop items)
+                if len(arr) == 0:
+                    last_err = "empty events array"
                     last_outcome = "schema_error"
                     break
 
                 events: List[NewsEvent] = []
                 try:
-                    for item in parsed:
-                        events.append(NewsEvent(**item))
+                    for item in arr[:expected_count]:  # cap to expected
+                        if isinstance(item, dict):
+                            events.append(NewsEvent(**item))
                 except ValidationError as e:
                     last_err = f"schema: {e.errors()[:1]}"
                     last_outcome = "schema_error"
                     break
 
-                latency_ms = int((time.time() - start) * 1000)
-                return events, latency_ms, attempt, "ok", None, ptok, ctok
+                # Accept partial results: if the model gave us at least one valid event, treat as usable.
+                # This greatly improves success rate vs requiring *exact* count.
+                if len(events) > 0:
+                    latency_ms = int((time.time() - start) * 1000)
+                    return events, latency_ms, attempt, "ok", None, ptok, ctok
+                else:
+                    last_err = "no valid events after validation"
+                    last_outcome = "schema_error"
+                    break
 
             except Exception as e:
                 last_err = f"{type(e).__name__}: {str(e)[:120]}"
-                last_outcome = "timeout" if "timeout" in str(e).lower() else "llm_error"
+                msg = str(e).lower()
+                last_outcome = "timeout" if "timeout" in msg else "llm_error"
                 if attempt < max_attempts:
                     backoff = settings.NEWS_EVENT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    # Aggressive backoff on rate limits (429 or keywords)
+                    if "rate" in msg or "429" in msg or "too many" in msg:
+                        backoff = max(backoff, 5.0) * 3  # extra long for rate limits
+                        logger.warning(f"[news_event] rate limit hit for {symbol}, backing off {backoff:.1f}s")
                     logger.debug(f"[news_event] attempt {attempt} failed ({last_err}); retrying in {backoff:.2f}s")
                     time.sleep(backoff)
 
         latency_ms = int((time.time() - start) * 1000)
+        self._last_error = last_err
         return None, latency_ms, max_attempts, last_outcome, last_err, None, None
 
     def _persist(

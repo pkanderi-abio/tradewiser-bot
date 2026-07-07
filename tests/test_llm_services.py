@@ -189,19 +189,31 @@ class TestNewsSeverityGate:
         # depends on current settings, but shouldn't crash
         assert hasattr(dec, "allow_new_buys")
 
-    def test_gate_evaluate_uses_analyzer(self):
-        """Gate should call analyzer and aggregate."""
+    def test_gate_evaluate_uses_extractor(self):
+        """Gate should use the production news_event_extractor (not the old analyzer)."""
         from unittest.mock import patch, MagicMock
         from app.services.news_severity_gate import NewsSeverityGate
+        from app.services.news_event_extractor import AggregateSignal
+
         gate = NewsSeverityGate()
-        mock_analyzer = MagicMock()
-        mock_analyzer.score_headline_severities.return_value = [{"severity": 5}, {"severity": 3}]
-        mock_analyzer.aggregate_severity.return_value = 8.0
-        with patch.object(gate, "_analyzer", mock_analyzer):
+
+        mock_signal = AggregateSignal(
+            symbol="AAPL",
+            aggregate=7.5,
+            max_abs_severity=8,
+            top_event_type="product_launch",
+            n_events=4,
+            n_dropped_below_min=1,
+        )
+
+        with patch("app.services.news_severity_gate.news_event_extractor") as mock_extractor:
+            mock_extractor.extract.return_value = [MagicMock(severity=8, event_type="product_launch")]
+            mock_extractor.aggregate_severity.return_value = mock_signal
+
             dec = gate.evaluate("AAPL")
-            assert dec.aggregate == 8.0
-            assert dec.allow_new_buys is True  # 8 > -4
-            mock_analyzer.score_headline_severities.assert_called()
+            assert dec.aggregate == 7.5
+            assert dec.allow_new_buys is True
+            mock_extractor.extract.assert_called()
 
 
 class TestMarketIntelligence:

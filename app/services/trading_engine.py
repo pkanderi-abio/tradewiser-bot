@@ -12,39 +12,39 @@ from app.services.utils import record_audit_entry
 from app.services.ai_advisor import ai_advisor, MIN_CONFIDENCE
 from app.services.risk_gate import risk_gate
 from app.services.regime import regime_gate
-from app.services.news_severity_gate import news_severity_gate
 from app.core.logger import logger
 from app.core.config import settings
 
 
 def _estimate_option_notional(stock_price: float, qty: int) -> float:
-    """ATM ~4-week call premiums run roughly 3–5% of the underlying; we use 5%
-    as a conservative overestimate so the concentration check leans cautious.
-    Multiplier 100 = standard equity option contract size."""
+    """Estimate notional for short-term ATM call options.
+    Uses ~5% of underlying as rough premium for the chosen weeks_out.
+    Used by risk gate for concentration. Options = leveraged short-term bets."""
     return max(0.0, float(stock_price) * 0.05 * 100 * qty)
 
 # Underlying stocks only — options are generated at trade time
 WATCHLIST: List[str] = ["SPY", "QQQ", "AAPL"]
 
-# ── Strategy parameters ────────────────────────────────────────────────────────
+# ── Short Term + Options Strategy parameters (loaded from settings for easy tuning) ─
+# This path is the dedicated "short term options" engine. It always buys/sells
+# ATM call options for leveraged short-duration moves. Tune via SHORT_TERM_* in .env.
 RSI_PERIOD         = 14
-RSI_BUY_THRESHOLD  = 35     # RSI < 35 = oversold → buy ATM call
-RSI_SELL_THRESHOLD = 70     # RSI > 70 = overbought → exit call
-SMA_PERIOD         = 50     # price must be above 50-day SMA (uptrend filter)
-OPTION_WEEKS_OUT   = 4      # buy options expiring ~4 weeks out
-PROFIT_TARGET      = 0.60   # close position at +60% option gain
-STOP_LOSS          = 0.30   # close position at -30% option loss
-DAYS_BEFORE_EXPIRY = 3      # close position this many days before expiry
+RSI_BUY_THRESHOLD  = int(getattr(settings, "SHORT_TERM_RSI_BUY_THRESHOLD", 35))
+RSI_SELL_THRESHOLD = int(getattr(settings, "SHORT_TERM_RSI_SELL_THRESHOLD", 70))
+SMA_PERIOD         = 50
+OPTION_WEEKS_OUT   = int(getattr(settings, "SHORT_TERM_OPTION_WEEKS_OUT", 2))   # shorter for short-term
+PROFIT_TARGET      = float(getattr(settings, "SHORT_TERM_PROFIT_TARGET", 0.50))
+STOP_LOSS          = float(getattr(settings, "SHORT_TERM_STOP_LOSS", 0.30))
+DAYS_BEFORE_EXPIRY = 3
 TRADE_QUANTITY     = 1
 
-# ── Position & risk controls ───────────────────────────────────────────────────
-MAX_POSITIONS            = 5     # max concurrent option positions
-IV_RANK_MAX              = 50    # skip BUY if 30-day HV rank > 50% (options expensive)
-EARNINGS_DAYS_MIN        = 7     # skip BUY if earnings within this many calendar days
-TRAILING_STOP_ACTIVATION = 0.20  # arm trailing stop after +20% gain
-TRAILING_STOP_PCT        = 0.15  # trail 15% below the peak mark price
-EXIT_FAILURE_COOLDOWN_SECONDS = 300  # after a SELL rejection, skip re-attempts for this long
-                                     # (without it, every 60s loop tick = another audit-log spam row)
+# ── Position & risk controls (short term options) ─────────────────────────────
+MAX_POSITIONS            = int(getattr(settings, "SHORT_TERM_MAX_POSITIONS", 5))
+IV_RANK_MAX              = int(getattr(settings, "SHORT_TERM_IV_RANK_MAX", 50))
+EARNINGS_DAYS_MIN        = int(getattr(settings, "SHORT_TERM_EARNINGS_BUFFER_DAYS", 7))
+TRAILING_STOP_ACTIVATION = float(getattr(settings, "SHORT_TERM_TRAILING_ACTIVATION", 0.20))
+TRAILING_STOP_PCT        = float(getattr(settings, "SHORT_TERM_TRAILING_STOP_PCT", 0.15))
+EXIT_FAILURE_COOLDOWN_SECONDS = 300
 
 
 # ── Technical indicator helpers ────────────────────────────────────────────────
@@ -380,13 +380,12 @@ async def start_trading_loop():
     from app.services.watchlist_manager import get_atm_option_symbols
     from app.services.news_event_strategy import news_event_strategy
 
-    logger.info("[START] Daily RSI strategy — RSI<35 + above SMA50 → buy ATM call")
+    logger.info("[START] Short Term Options strategy (Daily RSI) — short-term technical signals → ATM call options")
     logger.info(
-        f"[INFO] Buy RSI<{RSI_BUY_THRESHOLD} | Sell RSI>{RSI_SELL_THRESHOLD} | "
-        f"SMA{SMA_PERIOD} | Profit +{PROFIT_TARGET:.0%} | Stop -{STOP_LOSS:.0%} | "
-        f"Max {MAX_POSITIONS} positions | IV rank cap {IV_RANK_MAX}% | "
-        f"Earnings buffer {EARNINGS_DAYS_MIN}d | "
-        f"Trail activates at +{TRAILING_STOP_ACTIVATION:.0%} → -{TRAILING_STOP_PCT:.0%} floor"
+        f"[INFO] ShortTermOptions: Buy RSI<{RSI_BUY_THRESHOLD} | Sell RSI>{RSI_SELL_THRESHOLD} | "
+        f"SMA{SMA_PERIOD} | weeks_out={OPTION_WEEKS_OUT} | Profit +{PROFIT_TARGET:.0%} | Stop -{STOP_LOSS:.0%} | "
+        f"Max {MAX_POSITIONS} | IV cap {IV_RANK_MAX}% | Earnings buffer {EARNINGS_DAYS_MIN}d | "
+        f"Trail +{TRAILING_STOP_ACTIVATION:.0%} → -{TRAILING_STOP_PCT:.0%}"
     )
     if settings.NEWS_STRATEGY_ENABLED:
         logger.info(
@@ -421,7 +420,7 @@ async def start_trading_loop():
                     logger.info(f"[news_strategy] pass counters: {news_counters}")
             except Exception as e:
                 # Never let the news strategy crash the RSI loop.
-                logger.error(f"[news_strategy] pass failed (isolated): {e}")
+                logger.error(f"[news_strategy] pass failed (isolated): {e}", exc_info=False)
 
             # Reconcile every iteration: an unfilled BUY (DAY TIF) or a manual
             # close on the dashboard would otherwise leave the in-memory dict
@@ -430,25 +429,19 @@ async def start_trading_loop():
 
             # ── Once-per-day: compute RSI signals and open new positions ───────
             if rsi_strategy.last_signal_date != today:
-                symbols = list(WATCHLIST)
-                logger.info(f"[SIGNAL] Computing daily signals for {len(symbols)} stocks...")
+                # Use the full expert-curated watchlist (24 names across categories) for short-term option signals
+                from app.services.watchlist_manager import EXPERT_PICKS
+                symbols = list(EXPERT_PICKS.keys())
+                logger.info(f"[SIGNAL] Computing daily short-term option signals for {len(symbols)} stocks (short term + options focus)...")
 
                 raw_signals = await asyncio.gather(
                     *[asyncio.to_thread(get_daily_signal, sym) for sym in symbols],
                     return_exceptions=True,
                 )
 
-                # Compute news severity for all to filter and adjust signal strength (ported)
-                sev_results = await asyncio.gather(
-                    *[asyncio.to_thread(news_severity_gate.evaluate, sym) for sym in symbols],
-                    return_exceptions=True,
-                )
-                sev_map = {}
-                for sym, res in zip(symbols, sev_results):
-                    if not isinstance(res, Exception):
-                        sev_map[sym] = res
-
-                # Separate SELL triggers from BUY candidates
+                # Pure RSI signals for the legacy DailyRSIStrategy path.
+                # Note: News-driven entries are handled by NewsEventStrategy (run earlier).
+                # The legacy news severity boosting has been removed in favor of the unified NewsEventStrategy.
                 buy_candidates: List[tuple] = []
 
                 for sym, sig in zip(symbols, raw_signals):
@@ -458,24 +451,16 @@ async def start_trading_loop():
 
                     rsi_strategy.signals[sym] = sig
 
-                    sev = sev_map.get(sym)
-                    sev_info = f" | sev={getattr(sev, 'aggregate', 'n/a')}" if sev else ""
                     logger.info(
-                        f"[SIGNAL] {sym}: {sig['signal']} | "
-                        f"RSI={sig['rsi']} | SMA50={sig['sma50']} | "
-                        f"price=${sig['price']} | HV_rank={sig.get('hv_rank')} | "
+                        f"[SIGNAL] {sym}: {sig.get('signal', 'NONE')} | "
+                        f"RSI={sig.get('rsi')} | SMA50={sig.get('sma50')} | "
+                        f"price=${sig.get('price')} | HV_rank={sig.get('hv_rank')} | "
                         f"earnings_in={sig.get('days_to_earnings')}d | "
                         f"near_sma50={sig.get('near_sma50')} | "
-                        f"vol_above_avg={sig.get('vol_above_avg')}{sev_info}"
+                        f"vol_above_avg={sig.get('vol_above_avg')}"
                     )
 
                     if sig.get("signal") == "BUY" and not rsi_strategy.has_position(sym):
-                        if sev and not sev.allow_new_buys:
-                            logger.info(f"[NEWS_SEVERITY] {sym} BUY candidate blocked by negative severity")
-                            continue
-                        sig = dict(sig)
-                        if sev:
-                            sig["news_severity_aggregate"] = sev.aggregate
                         buy_candidates.append((sym, sig))
 
                     elif sig.get("signal") == "SELL" and rsi_strategy.has_position(sym):
@@ -505,31 +490,6 @@ async def start_trading_loop():
                         else:
                             logger.info(f"[AI] SELL filtered for {sym} — {decision['reason']}")
 
-                    else:
-                        # Adjust RSI signal strength using severity (more aggressive port)
-                        sev_agg = getattr(sev, 'aggregate', 0) if sev else 0
-                        boost_factor = getattr(settings, "NEWS_SEVERITY_BOOST_FACTOR", 2.0)
-                        threshold_mult = 0.5  # relative threshold for triggering boost
-                        if sev_agg >= getattr(settings, "NEWS_SEVERITY_MIN_AGGREGATE", 4.0) * threshold_mult:
-                            if not rsi_strategy.has_position(sym):
-                                effective_rsi = (sig.get("rsi") or 50) - (sev_agg * boost_factor)
-                                if effective_rsi < RSI_BUY_THRESHOLD:
-                                    boosted = dict(sig) if sig else {"signal": "BUY", "rsi": effective_rsi, "price": None, "sma50": None}
-                                    boosted["signal"] = "BUY"
-                                    boosted["news_boosted"] = True
-                                    boosted["news_severity_aggregate"] = sev_agg
-                                    boosted["effective_rsi"] = round(effective_rsi, 1)
-                                    buy_candidates.append((sym, boosted))
-                                    logger.info(f"[NEWS_SEVERITY] {sym} BUY strength adjusted: effective_rsi={effective_rsi:.1f} (raw {sig.get('rsi')}) from sev={sev_agg} (factor={boost_factor})")
-                                else:
-                                    # still boost marginal
-                                    boosted = dict(sig) if sig else {"signal": "BUY", "rsi": 40, "price": None, "sma50": None}
-                                    boosted["signal"] = "BUY"
-                                    boosted["news_boosted"] = True
-                                    boosted["news_severity_aggregate"] = sev_agg
-                                    buy_candidates.append((sym, boosted))
-                                    logger.info(f"[NEWS_SEVERITY] {sym} boosted to BUY candidate by positive severity {sev_agg} (factor={boost_factor})")
-
                 # Sort BUY candidates by RSI ascending (most oversold = highest priority)
                 buy_candidates.sort(key=lambda x: x[1].get("rsi") or 100)
 
@@ -543,19 +503,10 @@ async def start_trading_loop():
                     )
                     buy_candidates = []
 
-                # News severity gate (ported from experiment)
-                # Per-symbol check; blocks BUY if aggregate severity is strongly negative.
-                filtered = []
-                for sym, sig in buy_candidates:
-                    sev_dec = await asyncio.to_thread(news_severity_gate.evaluate, sym)
-                    if not sev_dec.allow_new_buys:
-                        logger.warning(f"[NEWS_SEVERITY] BUY skipped for {sym} — {sev_dec.reason}")
-                        continue
-                    # Attach for context passed to AI (avoids re-score in some paths)
-                    sig = dict(sig)
-                    sig["news_severity_aggregate"] = sev_dec.aggregate
-                    filtered.append((sym, sig))
-                buy_candidates = filtered
+                # Note: News-driven BUY filtering/boosting is now handled exclusively by
+                # NewsEventStrategy (which runs at the top of every loop). The legacy
+                # news_severity_gate integration for RSI has been removed to reduce
+                # duplication and unify around the event-driven strategy.
 
                 for sym, sig in buy_candidates:
                     if not rsi_strategy.has_capacity():
@@ -579,11 +530,12 @@ async def start_trading_loop():
                             "days_to_earnings": sig.get("days_to_earnings"),
                             "near_sma50":       sig.get("near_sma50"),
                             "vol_above_avg":    sig.get("vol_above_avg"),
-                            "news_severity_aggregate": sig.get("news_severity_aggregate"),
                         },
                     )
-                    if "news_severity" in decision:
-                        logger.debug(f"[AI] {sym} used news_severity {decision['news_severity'].get('aggregate')}")
+                    # Attribution for which strategy influenced the decision
+                    # (NewsEventStrategy handles its own; this is for the RSI path)
+                    if decision["action"] != "HOLD":
+                        logger.info(f"[DECISION] {sym} action={decision['action']} strategy=rsi")
                     if decision["action"] == "BUY" and decision["confidence"] >= MIN_CONFIDENCE:
                         stock_price = sig["price"] or 0
                         notional = _estimate_option_notional(stock_price, TRADE_QUANTITY)

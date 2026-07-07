@@ -7,27 +7,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 def find_env_file() -> Path:
     """
-    Find .env file, checking the known installation path first so a
-    world-writable CWD (e.g. C:\\Windows\\System32 when running as a service)
-    cannot shadow the real credentials file.
+    Find .env file. Prefers installation locations over CWD to prevent
+    a world-writable working directory from shadowing real credentials.
 
-    Search order:
-    1. Known installation directory (C:\\Program Files (x86)\\TradeWiser\\TradeWiser Bot)
-    2. Directory containing this file (development checkout root)
-    3. Current working directory (fallback for dev)
+    Search order (first match wins):
+    1. Linux system location: /etc/tradewiser/.env
+    2. Linux install location: /opt/tradewiser/.env
+    3. Windows service location (legacy)
+    4. Repo root (development checkout)
+    5. Current working directory (last resort)
     """
-    # 1. Known installation path — checked first to prevent CWD shadowing
-    service_env = Path(r"C:\Program Files (x86)\TradeWiser\TradeWiser Bot\.env")
-    if service_env.exists():
-        return service_env
+    candidates = []
 
-    # 2. Repo root relative to this file (app/core/config.py → ../../.env)
+    # 1. Linux system-wide (recommended for production on Ubuntu)
+    candidates.append(Path("/etc/tradewiser/.env"))
+
+    # 2. Common Linux install dir
+    candidates.append(Path("/opt/tradewiser/.env"))
+
+    # 3. Windows service install dir (kept for compatibility)
+    candidates.append(Path(r"C:\Program Files (x86)\TradeWiser\TradeWiser Bot\.env"))
+
+    # 4. Development repo root (relative to this file)
     repo_env = Path(__file__).resolve().parent.parent.parent / ".env"
-    if repo_env.exists():
-        return repo_env
+    candidates.append(repo_env)
 
-    # 3. CWD fallback (development only)
-    return Path.cwd() / ".env"
+    # 5. CWD fallback
+    candidates.append(Path.cwd() / ".env")
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    # If none exist, return the most likely production location so Settings
+    # can still raise a clear error if required keys are missing.
+    return Path("/etc/tradewiser/.env")
 
 
 ENV_FILE = find_env_file()
@@ -88,10 +102,12 @@ class Settings(BaseSettings):
     AI_MAX_HEADLINE_CHARS: int = Field(160, description="Per-headline character cap after sanitization")
 
     # ============================================================
-    # News Severity Scoring (ported from news-event severity experiment)
-    # Scores each headline for event_type + numeric severity (-10..+10).
-    # Aggregate feeds into AI context for better news-aware decisions.
+    # News Severity / Event Configuration
+    # Two related but distinct layers:
+    #   1. NEWS_SEVERITY_*     — lightweight aggregate for AI context + legacy RSI boosting
+    #   2. NEWS_EVENT_* + NEWS_STRATEGY_* — full production NewsEventExtractor + NewsEventStrategy
     # ============================================================
+    # Lightweight severity (used by AIAdvisor prompt + news_severity_gate + RSI boost)
     NEWS_SEVERITY_ENABLED: bool = Field(True, description="Enable per-headline LLM severity scoring (event_type + -10..+10 score)")
     NEWS_SEVERITY_LOOKBACK_DAYS: int = Field(3, description="Window for aggregating recent headline severity scores")
     NEWS_SEVERITY_MIN_AGGREGATE: float = Field(4.0, description="Aggregate severity threshold considered 'notable' (passed to AI for context)")
@@ -99,12 +115,7 @@ class Settings(BaseSettings):
     NEWS_SEVERITY_AGGREGATE: str = Field("sum", description="Aggregation for severity scores: 'sum' (default) or 'mean'")
     NEWS_SEVERITY_BOOST_FACTOR: float = Field(2.0, description="Factor by which positive severity aggregate lowers effective RSI for signal boosting in trading engine (higher = stronger effect)")
 
-    # ============================================================
-    # News Event Extractor (Phase 2 production service — feeds NewsEventStrategy)
-    # ============================================================
-    # Extracts {event_type, severity, confidence} per headline. Follows AI_* reliability
-    # pattern: kill switch, fail-closed, circuit breaker, cache, per-headline audit.
-    # Uses the same LLM provider chain as ai_advisor (Groq preferred, Ollama fallback).
+    # Full News Event Extractor (hardened, used by NewsEventStrategy)
     NEWS_EVENT_KILL_SWITCH: bool = Field(False, description="Emergency stop — force extract() to return an empty list without hitting the LLM")
     NEWS_EVENT_FAIL_CLOSED: bool = Field(True, description="On extractor failure, return no events (no signal). Set False only for non-live testing.")
     NEWS_EVENT_REQUEST_TIMEOUT_SECONDS: float = Field(15.0, description="Per-batch LLM timeout")
@@ -117,18 +128,18 @@ class Settings(BaseSettings):
     NEWS_EVENT_MAX_HEADLINES_PER_CALL: int = Field(30, description="Ceiling on headlines passed to extract() per symbol per pass")
     NEWS_EVENT_MIN_ABS_SEVERITY: int = Field(3, description="Drop events with |severity| below this threshold before aggregation")
 
-    # ============================================================
-    # NewsEvent Strategy (Phase 3+4 — multi-day event-driven positions)
-    # ============================================================
-    NEWS_STRATEGY_ENABLED: bool = Field(False, description="Master switch. Off by default: strategy code exists but doesn't trade until manually enabled after paper-observation.")
-    NEWS_STRATEGY_MAX_CONCURRENT: int = Field(3, description="Max concurrent open positions across all NewsEventStrategy instruments")
+    # NewsEvent Strategy configuration
+    NEWS_STRATEGY_ENABLED: bool = Field(False, description="Enable the full NewsEventStrategy (multi-day event driven positions). When False it still manages exits on existing positions.")
     NEWS_STRATEGY_SEVERITY_MIN_TO_ENTER: float = Field(4.0, description="Aggregate severity (per NEWS_SEVERITY_AGGREGATE) required to enter a new position")
     NEWS_STRATEGY_SEVERITY_MIN_OPTIONS: float = Field(7.0, description="Aggregate severity at/above which to route to ATM call options (leveraged conviction). Below this + above ENTER threshold => stock.")
-    NEWS_STRATEGY_HOLD_DAYS: int = Field(5, description="Max trading sessions to hold a news-driven position before time-stop")
-    NEWS_STRATEGY_STOP_LOSS_PCT: float = Field(0.08, description="Percent drop from entry that triggers a stop-loss exit")
-    NEWS_STRATEGY_TAKE_PROFIT_PCT: float = Field(0.15, description="Percent gain from entry that triggers a take-profit exit")
-    NEWS_STRATEGY_REVERSAL_SEVERITY_MULT: float = Field(-0.75, description="Exit if new aggregate severity has opposite sign and |severity| exceeds |entry severity| * this multiplier (e.g. entry +6, exit if new aggregate <= -4.5)")
+    NEWS_STRATEGY_HOLD_DAYS: int = Field(5, description="Default hold period in trading days for NewsEventStrategy positions")
+    NEWS_STRATEGY_STOP_LOSS_PCT: float = Field(0.08, description="Stop loss as fraction of entry price")
+    NEWS_STRATEGY_TAKE_PROFIT_PCT: float = Field(0.15, description="Take profit as fraction of entry price")
+    NEWS_STRATEGY_MAX_CONCURRENT: int = Field(3, description="Max concurrent open positions across all NewsEventStrategy instruments")
+    NEWS_STRATEGY_REVERSAL_SEVERITY_MULT: float = Field(-0.75, description="Exit if new aggregate severity has opposite sign and |severity| exceeds |entry severity| * this multiplier")
     NEWS_STRATEGY_POSITION_DOLLARS: float = Field(1000.0, description="Notional target per news-strategy position (equal-weight sizing v1)")
+
+    # (See grouped block above for the full set of NEWS_EVENT_* and NEWS_STRATEGY_* settings)
 
     # ============================================================
     # Multi-model Ensemble — Stage-1 screen (cheap/fast) → Stage-2 confirm (smart)
@@ -169,6 +180,23 @@ class Settings(BaseSettings):
 
     # Strategy filters
     STRATEGY_REQUIRE_UPTREND_FILTER: bool = Field(True, description="When true, BUY signals require price > SMA50 AND (near-SMA50 OR above-avg-volume). When false, the RSI-only condition is sufficient. Set to false to allow buying oversold names in confirmed downtrends — higher trade frequency but no protection against catching falling knives. Other gates (regime, AI, risk) still apply.")
+
+    # ============================================================
+    # Short Term Options Strategy (Daily RSI + momentum → ATM call options)
+    # This is the primary "short term + options" path. Always uses options
+    # for leverage on short-duration moves. Separate from the multi-day NewsEventStrategy.
+    # ============================================================
+    SHORT_TERM_ENABLED: bool = Field(True, description="Master switch for the short-term RSI options strategy")
+    SHORT_TERM_RSI_BUY_THRESHOLD: int = Field(35, description="RSI below this triggers BUY of ATM call (oversold short-term bounce)")
+    SHORT_TERM_RSI_SELL_THRESHOLD: int = Field(70, description="RSI above this triggers SELL of the call (overbought)")
+    SHORT_TERM_OPTION_WEEKS_OUT: int = Field(2, description="Target ~N-week expiry ATM calls for short-term gamma exposure (shorter than multi-day news positions)")
+    SHORT_TERM_PROFIT_TARGET: float = Field(0.50, description="Close short-term option position at this gain (e.g. 50%)")
+    SHORT_TERM_STOP_LOSS: float = Field(0.30, description="Hard stop on short-term option at this loss")
+    SHORT_TERM_MAX_POSITIONS: int = Field(5, description="Max concurrent short-term option positions")
+    SHORT_TERM_IV_RANK_MAX: int = Field(50, description="Skip short-term option buys if HV rank is this high (expensive vol)")
+    SHORT_TERM_EARNINGS_BUFFER_DAYS: int = Field(7, description="Avoid short-term option entries if earnings within N days")
+    SHORT_TERM_TRAILING_ACTIVATION: float = Field(0.20, description="Arm trailing stop on short-term option after this gain")
+    SHORT_TERM_TRAILING_STOP_PCT: float = Field(0.15, description="Trailing stop floor for short-term options once armed")
 
     # ============================================================
     # Scheduler Configuration

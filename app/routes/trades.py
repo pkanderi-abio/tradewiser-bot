@@ -221,6 +221,29 @@ async def news_severity_score(symbol: str, limit: int = 20):
     }
 
 
+@router.post("/news-severity/recompute")
+async def news_severity_recompute(symbol: str):
+    """Force re-extraction (bypasses some caches) for a symbol using the production extractor. Returns the new decision."""
+    from app.services.news_severity_gate import news_severity_gate
+    from app.services.news_feed import news_feed
+    from app.services.news_event_extractor import news_event_extractor
+
+    symbol = symbol.upper()
+    headlines = news_feed.headlines(symbol)
+    # Force fresh extraction
+    events = news_event_extractor.extract(symbol, headlines)
+    agg = news_event_extractor.aggregate_severity(events)
+    dec = news_severity_gate.evaluate(symbol)  # will pick up fresh data
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "n_events_extracted": len(events) if events else 0,
+        "aggregate": agg.aggregate if agg else 0.0,
+        "decision": dec.to_dict(),
+    }
+
+
 @router.get("/news-severity/aggregate")
 async def news_severity_aggregate(symbol: str):
     """Quick aggregate severity for a symbol (uses cached scores if available, else computes)."""
@@ -294,9 +317,10 @@ async def strategy_status():
 
     return {
         "status":             "ok",
-        "strategy":           "Daily RSI → ATM call options",
+        "strategy":           "Short Term Options (RSI daily signals → ATM call options)",
         "active_positions":   momentum_strategy.active_position_count(),
         "parameters": {
+            "type":                    "short_term_options",
             "rsi_period":              RSI_PERIOD,
             "rsi_buy_threshold":       RSI_BUY_THRESHOLD,
             "rsi_sell_threshold":      RSI_SELL_THRESHOLD,
@@ -310,6 +334,7 @@ async def strategy_status():
             "earnings_days_min":       EARNINGS_DAYS_MIN,
             "trailing_stop_activation": f"+{TRAILING_STOP_ACTIVATION:.0%}",
             "trailing_stop_pct":       f"-{TRAILING_STOP_PCT:.0%}",
+            "description":             "Pure technical short-term strategy. Always uses near-term ATM calls for leveraged exposure.",
         },
         "last_signal_date":   status["last_signal_date"],
         "positions":          status["positions"],

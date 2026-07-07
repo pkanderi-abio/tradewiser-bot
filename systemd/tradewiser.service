@@ -1,0 +1,45 @@
+[Unit]
+Description=TradeWiser AI Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradewiser
+Group=tradewiser
+WorkingDirectory=/opt/tradewiser
+
+# Load secrets from a protected system location
+EnvironmentFile=-/etc/tradewiser/.env
+
+Environment=PATH=/opt/tradewiser/venv/bin
+Environment=PYTHONUNBUFFERED=1
+
+# --- Option 1: uvicorn (simple, good for development/testing) ---
+ExecStart=/opt/tradewiser/venv/bin/uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --log-level info
+
+# --- Option 2: gunicorn (recommended for production) ---
+# 1. Install: ./venv/bin/pip install gunicorn
+# 2. Uncomment the line below and comment out the uvicorn ExecStart
+# ExecStart=/opt/tradewiser/venv/bin/gunicorn -k uvicorn.workers.UvicornWorker \
+#     -w 1 \
+#     -b 0.0.0.0:8000 \
+#     --timeout 120 \
+#     --access-logfile - \
+#     --error-logfile - \
+#     app.main:app
+
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

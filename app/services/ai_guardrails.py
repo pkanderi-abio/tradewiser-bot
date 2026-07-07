@@ -178,14 +178,17 @@ class CircuitBreaker:
         with self._lock:
             self._consecutive_failures += 1
             self._total_failures += 1
-            if self._consecutive_failures >= self._threshold and self._opened_at is None:
+            # Always (re)trip on reaching threshold or on failed probe in half-open.
+            # This ensures that a failed half-open probe restarts the cooldown period
+            # instead of leaving the breaker "stuck" in half_open forever.
+            if self._consecutive_failures >= self._threshold:
                 self._opened_at = time.time()
 
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "state": self.state(),
-                "consecutive_failures": self._consecutive_failures,
+                "consecutive_failures": min(self._consecutive_failures, self._threshold * 2),  # cap for display
                 "total_failures": self._total_failures,
                 "total_successes": self._total_successes,
                 "opened_at": self._opened_at,

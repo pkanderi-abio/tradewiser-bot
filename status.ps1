@@ -133,12 +133,21 @@ if ($null -eq $strategy) {
     Write-Warn "Strategy" "Unavailable"
 } else {
     $p = $strategy.parameters
-    Write-OK "Strategy"       "Momentum"
-    Write-OK "Window"         "$($p.window) price ticks (collected every 5s)"
-    $buyPct  = [math]::Round($p.buy_threshold  * 100, 2)
-    $sellPct = [math]::Round($p.sell_threshold * 100, 2)
-    Write-OK "Buy threshold"  "+${buyPct}% momentum across window"
-    Write-OK "Sell threshold" "${sellPct}% momentum across window"
+    $isShortTermOpts = ($p.type -eq "short_term_options") -or ($strategy.strategy -like "*Short*Options*") -or ($strategy.strategy -like "*RSI*")
+    if ($isShortTermOpts) {
+        Write-OK "Strategy" "Short Term Options (RSI → ATM call options)"
+        Write-OK "Instrument" "Always ATM calls (short-term leveraged)"
+        if ($p.option_weeks_out) { Write-OK "Option weeks out" $p.option_weeks_out }
+        if ($p.profit_target) { Write-OK "Profit target" $p.profit_target }
+        if ($p.stop_loss) { Write-OK "Stop loss" $p.stop_loss }
+    } else {
+        Write-OK "Strategy"       "Momentum"
+        Write-OK "Window"         "$($p.window) price ticks (collected every 5s)"
+        $buyPct  = [math]::Round($p.buy_threshold  * 100, 2)
+        $sellPct = [math]::Round($p.sell_threshold * 100, 2)
+        Write-OK "Buy threshold"  "+${buyPct}% momentum across window"
+        Write-OK "Sell threshold" "${sellPct}% momentum across window"
+    }
 
     # Positions
     Write-Host ""
@@ -317,6 +326,9 @@ if ($null -eq $news) {
     }
     if ($x.circuit.state -ne "closed") {
         Write-Warn "Extractor circuit" "$($x.circuit.state) (consecutive_failures=$($x.circuit.consecutive_failures))"
+        if ($x.last_error) {
+            Write-Host "       last_error: $($x.last_error)" -ForegroundColor DarkYellow
+        }
     }
 
     Write-OK "Entry threshold"    "sev >= $($s.min_severity_to_enter) (stock) | sev >= $($s.min_severity_for_options) (options)"
