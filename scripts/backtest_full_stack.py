@@ -236,18 +236,62 @@ class Signal:
 AiCallable = Callable[[Signal], CachedDecision]
 
 
+# Reasons that mean "the advisor short-circuited without asking the model".
+# These decisions must NOT be cached — otherwise re-runs replay fake HOLDs
+# forever and the backtest silently reports zero trades. Matched as
+# substrings of ai_advisor's reason field.
+_FAIL_CLOSED_REASON_MARKERS = (
+    "circuit breaker open",
+    "kill_switch",
+    "LLM unavailable",
+)
+
+
+def _is_fail_closed(decision: dict) -> bool:
+    reason = (decision.get("reason") or "").lower()
+    return any(marker.lower() in reason for marker in _FAIL_CLOSED_REASON_MARKERS)
+
+
+def reset_advisor_circuit() -> None:
+    """Force the live ai_advisor's breaker back to CLOSED before a backtest.
+
+    The advisor is a module-level singleton — its circuit state carries over
+    between runs (and worse: if a prior backtest tripped it, the next one
+    starts by seeing every call short-circuited to HOLD). We reset here so
+    each backtest run starts from a clean slate, and we log the pre-reset
+    state so operators can see if the previous run stressed the provider.
+    """
+    try:
+        from app.services.ai_advisor import ai_advisor
+        breaker = getattr(ai_advisor, "_breaker", None)
+        if breaker is None:
+            return
+        pre = breaker.snapshot()
+        with breaker._lock:                    # noqa: SLF001 — reset internals
+            breaker._consecutive_failures = 0
+            breaker._opened_at = None
+        if pre.get("state") != "closed":
+            print(f"[backtest] reset AI circuit breaker (was {pre})")
+    except Exception as e:
+        print(f"[backtest] could not reset circuit breaker: {e}")
+
+
 def make_ai_callable(
     *,
     live: bool,
     cache: AIDecisionCache,
     provider_hint: str = "backtest",
     model_hint: str = "backtest",
+    per_call_delay_s: float = 0.0,
 ) -> AiCallable:
     """Build the AI decision function used by the backtest.
 
     - live=True: import the real advisor, call decide(), cache the result.
     - live=False: cache-only (miss → deterministic pass-through: signal
       approved at confidence 0.7). Used for offline runs / smoke tests.
+
+    per_call_delay_s throttles live calls to keep us under provider rate
+    limits and avoid tripping the ai_advisor's circuit breaker mid-run.
     """
     if live:
         from app.services.ai_advisor import ai_advisor
@@ -265,6 +309,8 @@ def make_ai_callable(
             hit = cache.get(key)
             if hit is not None:
                 return hit
+            if per_call_delay_s > 0:
+                time.sleep(per_call_delay_s)
             decision = ai_advisor.decide(
                 symbol=sig.symbol, price=sig.price, momentum=sig.rsi,
                 price_history=sig.price_history, position=0,
@@ -275,11 +321,15 @@ def make_ai_callable(
                 confidence=float(decision.get("confidence", 0.0)),
                 reason=decision.get("reason", ""),
             )
-            cache.put(
-                key, symbol=sig.symbol,
-                date_str=sig.date.strftime("%Y-%m-%d"),
-                decision=cd, provider=provider, model=model,
-            )
+            # Don't cache fail-closed HOLDs — those aren't real model output.
+            # Caching them poisons every future re-run: signals that hit the
+            # breaker during a rate-limit spike would replay as HOLD forever.
+            if not _is_fail_closed(decision):
+                cache.put(
+                    key, symbol=sig.symbol,
+                    date_str=sig.date.strftime("%Y-%m-%d"),
+                    decision=cd, provider=provider, model=model,
+                )
             return cd
 
         return _live
@@ -644,6 +694,15 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--cache-path", default="runs/ai_decision_cache.sqlite")
     ap.add_argument("--trade-dollars", type=float, default=1000.0)
     ap.add_argument("--ai-min-confidence", type=float, default=0.65)
+    ap.add_argument("--ai-call-delay-ms", type=int, default=0,
+                    help="Sleep this long between live LLM calls to stay "
+                         "under provider rate limits (and keep the advisor's "
+                         "circuit breaker closed). 250-500ms works for Groq.")
+    ap.add_argument("--purge-fail-closed", action="store_true",
+                    help="Delete any cached decisions whose reason indicates "
+                         "the advisor short-circuited (circuit-open, kill "
+                         "switch). Run this once if a prior backtest tripped "
+                         "the breaker and poisoned the cache.")
     return ap.parse_args()
 
 
@@ -655,7 +714,17 @@ def main() -> None:
     out_dir = Path(args.out_dir) / f"full_stack_{ts}"
 
     cache = AIDecisionCache(args.cache_path)
-    ai_call = make_ai_callable(live=args.live_ai, cache=cache)
+    if args.purge_fail_closed:
+        removed = cache.purge_by_reason(list(_FAIL_CLOSED_REASON_MARKERS))
+        print(f"[backtest] purged {removed} fail-closed cache entries")
+
+    if args.live_ai:
+        reset_advisor_circuit()
+
+    ai_call = make_ai_callable(
+        live=args.live_ai, cache=cache,
+        per_call_delay_s=args.ai_call_delay_ms / 1000.0,
+    )
     book = SyntheticBook()
 
     result = run_backtest(

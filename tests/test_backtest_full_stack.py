@@ -20,6 +20,8 @@ from app.services.backtest_cache import (
     make_cache_key,
 )
 from scripts.backtest_full_stack import (
+    _FAIL_CLOSED_REASON_MARKERS,
+    _is_fail_closed,
     RunResult,
     Signal,
     SyntheticBook,
@@ -204,6 +206,85 @@ class TestFullStackRunner:
         eq1 = [(row["date"], round(row["equity"], 2)) for row in r1.equity_curve]
         eq2 = [(row["date"], round(row["equity"], 2)) for row in r2.equity_curve]
         assert eq1 == eq2
+
+
+class TestFailClosedCacheProtection:
+    """When the ai_advisor short-circuits (circuit open, kill switch),
+    the returned decision is a fake HOLD, not a real model verdict.
+    Caching those poisons every re-run — signals that hit the breaker
+    during a rate-limit spike would silently replay as HOLD forever.
+    That was a real bug during a 9-symbol Groq run."""
+
+    def test_fail_closed_detection_matches_advisor_reason_strings(self):
+        # These are the reason strings the real ai_advisor emits.
+        assert _is_fail_closed({"reason": "circuit breaker open — LLM unavailable"})
+        assert _is_fail_closed({"reason": "kill_switch enabled"})
+        assert _is_fail_closed({"reason": "LLM unavailable"})
+        # Real HOLDs from the model must not trip the detector.
+        assert not _is_fail_closed({"reason": "RSI oversold but overhead resistance"})
+        assert not _is_fail_closed({"reason": ""})
+        assert not _is_fail_closed({})
+
+    def test_live_advisor_fail_closed_response_is_not_cached(self, in_memory_cache):
+        """Simulate a live advisor that returns a circuit-open HOLD. The
+        wrapper must NOT persist that to the cache — otherwise the next run
+        (with a healthy provider) would replay the fake HOLD instead of asking."""
+        class _FakeAdvisor:
+            def get_provider(self): return "groq"
+            def get_model(self): return "llama-3.1"
+            def decide(self, **kw):
+                return {"action": "HOLD", "confidence": 0.0,
+                        "reason": "circuit breaker open — LLM unavailable"}
+
+        import scripts.backtest_full_stack as bfs
+        # Patch the module-level import used inside make_ai_callable.
+        import sys
+        fake_module = type(sys)("fake_ai_advisor")
+        fake_module.ai_advisor = _FakeAdvisor()
+        sys.modules["app.services.ai_advisor"] = fake_module
+        try:
+            ai_call = bfs.make_ai_callable(live=True, cache=in_memory_cache)
+            sig = Signal("AAPL", "BUY", 180.0, 32.0, [180.0, 179.0, 178.0],
+                         pd.Timestamp("2024-06-01"))
+            cd = ai_call(sig)
+        finally:
+            # Don't leave a shim in sys.modules — the real advisor imports
+            # get_news which would then break in later tests.
+            del sys.modules["app.services.ai_advisor"]
+
+        # Wrapper still returns the fail-closed HOLD to the caller — the
+        # backtest's downstream logic will interpret it correctly.
+        assert cd.action == "HOLD"
+        # But NOTHING is in the cache — a healthy re-run would call again.
+        assert in_memory_cache.stats()["count"] == 0
+
+    def test_purge_removes_fail_closed_rows_only(self, in_memory_cache):
+        """--purge-fail-closed drops the poisoned rows without touching
+        legitimate HOLDs (or BUYs) that were real model output."""
+        from app.services.backtest_cache import CachedDecision, make_cache_key
+        good_key = make_cache_key(
+            symbol="AAPL", date_str="2024-06-01", proposed_action="BUY",
+            price=180.0, momentum=32.0, price_history=[180, 179, 178],
+            provider="groq", model="llama-3.1",
+        )
+        bad_key = make_cache_key(
+            symbol="MSFT", date_str="2024-06-01", proposed_action="BUY",
+            price=400.0, momentum=32.0, price_history=[400, 399, 398],
+            provider="groq", model="llama-3.1",
+        )
+        in_memory_cache.put(good_key, symbol="AAPL", date_str="2024-06-01",
+            decision=CachedDecision("BUY", 0.75, "RSI oversold with volume confirm"),
+            provider="groq", model="llama-3.1")
+        in_memory_cache.put(bad_key, symbol="MSFT", date_str="2024-06-01",
+            decision=CachedDecision("HOLD", 0.0, "circuit breaker open — LLM unavailable"),
+            provider="groq", model="llama-3.1")
+        assert in_memory_cache.stats()["count"] == 2
+
+        removed = in_memory_cache.purge_by_reason(list(_FAIL_CLOSED_REASON_MARKERS))
+
+        assert removed == 1
+        assert in_memory_cache.get(good_key) is not None
+        assert in_memory_cache.get(bad_key) is None
 
 
 class TestSyntheticBook:

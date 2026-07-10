@@ -148,6 +148,23 @@ class AIDecisionCache:
             "path": self._path,
         }
 
+    def purge_by_reason(self, patterns: list[str]) -> int:
+        """Delete rows whose reason matches ANY of the (case-insensitive)
+        substring patterns. Returns rows deleted.
+
+        The intended caller is the backtest runner scrubbing fail-closed
+        HOLDs that were cached before we knew better. Safe to run repeatedly.
+        """
+        if not patterns:
+            return 0
+        with self._lock:
+            where = " OR ".join(["LOWER(reason) LIKE ?"] * len(patterns))
+            args = [f"%{p.lower()}%" for p in patterns]
+            cur = self._conn.execute(
+                f"DELETE FROM ai_decision_cache WHERE {where}", args
+            )
+            return cur.rowcount or 0
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
