@@ -244,7 +244,13 @@ class NewsEventStrategy:
         except Exception as e:
             logger.warning(f"[news_strategy] quote failed for {cand.symbol}: {e}")
             return None
-        price = quote.get("pLast") or quote.get("ask") if quote else None
+        # Prefer ask for entry sizing — that's what we'd actually pay. pLast can
+        # be very stale for thinly-traded options and would under-size notional
+        # against the risk gate's concentration/daily-loss checks.
+        if not quote:
+            logger.info(f"[news_strategy] no quote for {cand.symbol}, skipping entry")
+            return None
+        price = quote.get("ask") or quote.get("pLast")
         if not price or price <= 0:
             logger.info(f"[news_strategy] no usable quote for {cand.symbol}, skipping entry")
             return None

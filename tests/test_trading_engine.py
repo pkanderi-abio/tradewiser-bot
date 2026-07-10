@@ -11,7 +11,9 @@ from app.services.trading_engine import (
     TRADE_QUANTITY,
     _compute_rsi,
     _days_to_expiry,
+    _estimate_option_notional,
     _parse_underlying,
+    _resolve_option_and_notional,
     get_daily_signal,
     momentum_strategy,
     rsi_strategy,
@@ -237,3 +239,97 @@ class TestUptrendFilter:
             patch.stopall()
         assert sig["signal"] == "BUY", f"expected BUY but got {sig}"
         assert sig["rsi"] < RSI_BUY_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# _resolve_option_and_notional — feeds real premium into the risk gate
+# ---------------------------------------------------------------------------
+
+class TestResolveOptionAndNotional:
+    """The risk gate cares whether one position exceeds a % of equity. The old
+    5% heuristic under-fired on high-IV names (e.g. TSLA weeklies routinely
+    price at 8-12% of underlying), so concentration caps let through positions
+    they shouldn't have. This helper now feeds the risk gate the real ask."""
+
+    def test_uses_live_ask_when_quote_available(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols",
+            lambda s, w: ["O:AAPL260117C00185000"],
+        )
+        monkeypatch.setattr(
+            "app.services.trading_engine.alpaca_client.get_batch_quotes",
+            lambda syms: {"O:AAPL260117C00185000": {"ask": 4.20, "bid": 4.10}},
+        )
+        opt_sym, notional = _resolve_option_and_notional("AAPL", 185.0, 1, 4)
+        assert opt_sym == "O:AAPL260117C00185000"
+        # ask=4.20 * 100 shares * 1 contract = $420 — the real cost, not 5%×185×100=$925
+        assert notional == pytest.approx(420.0)
+
+    def test_falls_back_to_heuristic_when_no_ask(self, monkeypatch):
+        """Weekend / pre-market: quote comes back empty. Fall back to 5%
+        heuristic — the risk gate must still see a positive number so
+        concentration checks don't silently disable themselves."""
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols",
+            lambda s, w: ["O:AAPL260117C00185000"],
+        )
+        monkeypatch.setattr(
+            "app.services.trading_engine.alpaca_client.get_batch_quotes",
+            lambda syms: {},  # feed empty (pre-market)
+        )
+        opt_sym, notional = _resolve_option_and_notional("AAPL", 185.0, 1, 4)
+        assert opt_sym == "O:AAPL260117C00185000"
+        assert notional == pytest.approx(_estimate_option_notional(185.0, 1))
+        assert notional > 0
+
+    def test_falls_back_when_quote_call_raises(self, monkeypatch):
+        """Broker outage during quote lookup. ATM symbol resolved fine, so
+        we still know what we'd trade — just size it via the heuristic."""
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols",
+            lambda s, w: ["O:AAPL260117C00185000"],
+        )
+        def _boom(_syms):
+            raise RuntimeError("alpaca down")
+        monkeypatch.setattr(
+            "app.services.trading_engine.alpaca_client.get_batch_quotes", _boom
+        )
+        opt_sym, notional = _resolve_option_and_notional("AAPL", 185.0, 1, 4)
+        assert opt_sym == "O:AAPL260117C00185000"
+        assert notional == pytest.approx(_estimate_option_notional(185.0, 1))
+
+    def test_returns_none_when_atm_lookup_empty(self, monkeypatch):
+        """If we can't even resolve an ATM symbol, the caller should skip the
+        trade entirely — no symbol, no order."""
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols",
+            lambda s, w: [],
+        )
+        opt_sym, notional = _resolve_option_and_notional("AAPL", 185.0, 1, 4)
+        assert opt_sym is None
+        assert notional == 0.0
+
+    def test_returns_none_when_atm_lookup_raises(self, monkeypatch):
+        """Same treatment on exception — never fabricate a trade."""
+        def _boom(_s, _w):
+            raise RuntimeError("yfinance rate limit")
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols", _boom
+        )
+        opt_sym, notional = _resolve_option_and_notional("AAPL", 185.0, 1, 4)
+        assert opt_sym is None
+        assert notional == 0.0
+
+    def test_scales_by_quantity(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.watchlist_manager.get_atm_option_symbols",
+            lambda s, w: ["O:SPY260117C00500000"],
+        )
+        monkeypatch.setattr(
+            "app.services.trading_engine.alpaca_client.get_batch_quotes",
+            lambda syms: {"O:SPY260117C00500000": {"ask": 3.00}},
+        )
+        _, notional_1 = _resolve_option_and_notional("SPY", 500.0, 1, 4)
+        _, notional_5 = _resolve_option_and_notional("SPY", 500.0, 5, 4)
+        assert notional_1 == pytest.approx(300.0)
+        assert notional_5 == pytest.approx(1500.0)

@@ -22,6 +22,53 @@ def _estimate_option_notional(stock_price: float, qty: int) -> float:
     Used by risk gate for concentration. Options = leveraged short-term bets."""
     return max(0.0, float(stock_price) * 0.05 * 100 * qty)
 
+
+def _resolve_option_and_notional(
+    stock_symbol: str,
+    stock_price: float,
+    qty: int,
+    weeks_out: int,
+) -> tuple[Optional[str], float]:
+    """Resolve the ATM call symbol AND its real-quote notional in one shot.
+
+    Real notional uses the option's ask × 100 × qty so the risk gate's
+    concentration and daily-loss checks reflect what we'd actually pay.
+    Falls back to _estimate_option_notional (5% heuristic) if the quote is
+    unavailable — a stale/pre-market feed should not silently disable the
+    gate. Returns (None, 0.0) if the ATM lookup itself fails so the caller
+    can skip the trade entirely.
+    """
+    from app.services.watchlist_manager import get_atm_option_symbols
+
+    try:
+        opts = get_atm_option_symbols(stock_symbol, weeks_out)
+    except Exception as e:
+        logger.warning(f"[NOTIONAL] ATM lookup failed for {stock_symbol}: {e}")
+        return None, 0.0
+
+    opt_sym = opts[0] if opts else None
+    if not opt_sym:
+        return None, 0.0
+
+    ask = 0.0
+    try:
+        quotes = alpaca_client.get_batch_quotes([opt_sym]) or {}
+        q = quotes.get(opt_sym) or {}
+        ask = float(q.get("ask") or 0.0)
+    except Exception as e:
+        logger.debug(f"[NOTIONAL] quote lookup failed for {opt_sym}: {e}")
+
+    if ask > 0:
+        return opt_sym, ask * 100 * qty
+
+    # No live ask — pre-market, weekend, or transient feed hiccup. Fall back
+    # to the heuristic so the risk gate still sees a reasonable number.
+    logger.warning(
+        f"[NOTIONAL] No live ask for {opt_sym}, falling back to 5% heuristic "
+        f"for risk gate sizing"
+    )
+    return opt_sym, _estimate_option_notional(stock_price, qty)
+
 # Underlying stocks only — options are generated at trade time
 WATCHLIST: List[str] = ["SPY", "QQQ", "AAPL"]
 
@@ -377,7 +424,6 @@ momentum_strategy = rsi_strategy  # backward-compatible alias used by routes
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 async def start_trading_loop():
-    from app.services.watchlist_manager import get_atm_option_symbols
     from app.services.news_event_strategy import news_event_strategy
 
     logger.info("[START] Short Term Options strategy (Daily RSI) — short-term technical signals → ATM call options")
@@ -538,7 +584,19 @@ async def start_trading_loop():
                         logger.info(f"[DECISION] {sym} action={decision['action']} strategy=rsi")
                     if decision["action"] == "BUY" and decision["confidence"] >= MIN_CONFIDENCE:
                         stock_price = sig["price"] or 0
-                        notional = _estimate_option_notional(stock_price, TRADE_QUANTITY)
+                        # Resolve ATM option + live-quote notional BEFORE the
+                        # risk gate so concentration/daily-loss checks reflect
+                        # real premium, not a 5% heuristic that under-fires on
+                        # high-IV names. Skip the trade entirely if the ATM
+                        # lookup returns nothing.
+                        call_sym, notional = await asyncio.to_thread(
+                            _resolve_option_and_notional,
+                            sym, stock_price, TRADE_QUANTITY, OPTION_WEEKS_OUT,
+                        )
+                        if call_sym is None:
+                            logger.warning(f"[BUY] Option lookup returned nothing for {sym}, skipping")
+                            continue
+
                         risk = await asyncio.to_thread(
                             risk_gate.evaluate, sym, "BUY", notional
                         )
@@ -546,14 +604,6 @@ async def start_trading_loop():
                             logger.warning(f"[RISK] BUY blocked for {sym} — {risk.reason}")
                             continue
 
-                        try:
-                            opts     = await asyncio.to_thread(
-                                get_atm_option_symbols, sym, OPTION_WEEKS_OUT
-                            )
-                            call_sym = opts[0] if opts else None
-                        except Exception as e:
-                            logger.warning(f"[BUY] Option lookup failed for {sym}: {e}")
-                            call_sym = None
                         rsi_strategy.execute_buy(sym, stock_price, call_sym)
                     else:
                         logger.info(f"[AI] BUY filtered for {sym} — {decision['reason']}")
