@@ -216,12 +216,25 @@ class TestFailClosedCacheProtection:
     That was a real bug during a 9-symbol Groq run."""
 
     def test_fail_closed_detection_matches_advisor_reason_strings(self):
-        # These are the reason strings the real ai_advisor emits.
+        # Every reason string the real ai_advisor._hold() emits on failure.
+        # If this list drifts from ai_advisor.py, the backtest will poison
+        # its cache with fake HOLDs — as happened on a real 9-symbol run
+        # where AuthenticationError 401 got cached for 173 signals.
         assert _is_fail_closed({"reason": "circuit breaker open — LLM unavailable"})
         assert _is_fail_closed({"reason": "kill_switch enabled"})
         assert _is_fail_closed({"reason": "LLM unavailable"})
+        assert _is_fail_closed({
+            "reason": "LLM llm_error: AuthenticationError: Error code: 401"
+        })
+        assert _is_fail_closed({"reason": "LLM timeout: request exceeded 15s"})
+        assert _is_fail_closed({"reason": "LLM schema_error: missing field 'action'"})
         # Real HOLDs from the model must not trip the detector.
         assert not _is_fail_closed({"reason": "RSI oversold but overhead resistance"})
+        # News-severity hard gate is NOT a fail-closed HOLD — it's a real
+        # deterministic decision on real news data and should be cached.
+        assert not _is_fail_closed({
+            "reason": "news severity aggregate too negative (-5.2)"
+        })
         assert not _is_fail_closed({"reason": ""})
         assert not _is_fail_closed({})
 

@@ -240,10 +240,24 @@ AiCallable = Callable[[Signal], CachedDecision]
 # These decisions must NOT be cached — otherwise re-runs replay fake HOLDs
 # forever and the backtest silently reports zero trades. Matched as
 # substrings of ai_advisor's reason field.
+#
+# Fail-closed reason strings emitted by ai_advisor._hold:
+#   "kill_switch enabled"
+#   "circuit breaker open — LLM unavailable"
+#   "LLM llm_error: <exception>"         (auth error, network error, 5xx)
+#   "LLM timeout: <detail>"
+#   "LLM schema_error: <detail>"
+#
+# Deliberately does NOT include "news severity aggregate too negative" —
+# that's a legitimate deterministic gate on real news data, not a provider
+# failure, and its cache entries should be preserved across runs.
 _FAIL_CLOSED_REASON_MARKERS = (
     "circuit breaker open",
     "kill_switch",
     "LLM unavailable",
+    "LLM llm_error",
+    "LLM timeout",
+    "LLM schema_error",
 )
 
 
