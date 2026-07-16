@@ -186,6 +186,29 @@ class TestFailClosed:
         decision = fresh_advisor.decide("AAPL", 150.0, 0, [], 0, "BUY")
         assert decision["action"] == "HOLD"
 
+    def test_fail_closed_hold_is_not_cached(self, fresh_advisor, monkeypatch):
+        """Regression: a single LLM error must not lock the symbol as HOLD
+        for CACHE_TTL. The next call has to actually retry the LLM, otherwise
+        a transient auth blip or rate limit silently blocks live trading for
+        that symbol for up to an hour and bypasses the circuit-breaker
+        cooldown (the cache hit fires before the breaker check)."""
+        bad_client = MagicMock()
+        bad_client.chat.completions.create.side_effect = RuntimeError("network down")
+        monkeypatch.setattr(fresh_advisor, "_get_client", lambda: bad_client)
+        monkeypatch.setattr(fresh_advisor, "_get_news", lambda s: [])
+
+        first = fresh_advisor.decide("AAPL", 150.0, 0, [], 0, "BUY")
+        assert first["action"] == "HOLD"
+        assert "AAPL" not in fresh_advisor._decision_cache
+
+        # Second call on the same symbol must reach the LLM again — the
+        # cache from the first call cannot short-circuit it. Provider has
+        # recovered in this scenario.
+        good = json.dumps({"action": "BUY", "confidence": 0.85, "reason": "recovered"})
+        monkeypatch.setattr(fresh_advisor, "_get_client", lambda: _mock_llm_client(good))
+        second = fresh_advisor.decide("AAPL", 150.0, 0, [], 0, "BUY")
+        assert second["action"] == "BUY"
+
 
 class TestHappyPath:
     def test_valid_llm_response_approves_buy(self, fresh_advisor, monkeypatch):

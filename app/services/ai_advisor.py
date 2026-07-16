@@ -40,6 +40,7 @@ from app.services.ai_guardrails import (
     CircuitBreaker,
     CircuitState,
     ValidationError,
+    is_fail_closed,
 )
 from app.services.market_data import market_data_feed
 from app.services.news_feed import news_feed
@@ -276,7 +277,14 @@ class AIAdvisor:
             if confirmed is not None:
                 decision = confirmed
 
-        self._decision_cache[symbol] = (time.time(), decision)
+        # Don't cache fail-closed HOLDs — a single LLM auth blip / rate limit
+        # would otherwise lock this symbol as HOLD for CACHE_TTL (up to 1h)
+        # and bypass the circuit breaker's short cooldown, since the cache
+        # hit at line ~172 fires before the breaker check. Real verdicts
+        # (including severity_gate HOLDs, which are deterministic gates on
+        # real news data) are still cached.
+        if not is_fail_closed(decision):
+            self._decision_cache[symbol] = (time.time(), decision)
 
         logger.info(
             f"[AI/{self.get_provider()}] {symbol} proposed={proposed_action} → "
