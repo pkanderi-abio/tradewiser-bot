@@ -236,22 +236,12 @@ class Signal:
 AiCallable = Callable[[Signal], CachedDecision]
 
 
-# Reasons that mean "the advisor short-circuited without asking the model".
-# These decisions must NOT be cached — otherwise re-runs replay fake HOLDs
-# forever and the backtest silently reports zero trades. Matched as
-# substrings of ai_advisor's reason field.
-#
-# Fail-closed reason strings emitted by ai_advisor._hold:
-#   "kill_switch enabled"
-#   "circuit breaker open — LLM unavailable"
-#   "LLM llm_error: <exception>"         (auth error, network error, 5xx)
-#   "LLM timeout: <detail>"
-#   "LLM schema_error: <detail>"
-#
-# Deliberately does NOT include "news severity aggregate too negative" —
-# that's a legitimate deterministic gate on real news data, not a provider
-# failure, and its cache entries should be preserved across runs.
-_FAIL_CLOSED_REASON_MARKERS = (
+# Legacy reason-substring markers used by --purge-fail-closed to clean up
+# poisoned rows that predate the outcome field. New rows can't get poisoned
+# (AIDecisionCache.put refuses fail-closed decisions), so this list only
+# needs to cover what historically leaked through — no need to keep it in
+# sync with future advisor changes.
+_LEGACY_FAIL_CLOSED_REASON_MARKERS = (
     "circuit breaker open",
     "kill_switch",
     "LLM unavailable",
@@ -259,11 +249,6 @@ _FAIL_CLOSED_REASON_MARKERS = (
     "LLM timeout",
     "LLM schema_error",
 )
-
-
-def _is_fail_closed(decision: dict) -> bool:
-    reason = (decision.get("reason") or "").lower()
-    return any(marker.lower() in reason for marker in _FAIL_CLOSED_REASON_MARKERS)
 
 
 def reset_advisor_circuit() -> None:
@@ -334,16 +319,18 @@ def make_ai_callable(
                 action=decision.get("action", "HOLD"),
                 confidence=float(decision.get("confidence", 0.0)),
                 reason=decision.get("reason", ""),
+                outcome=decision.get("outcome", "ok"),
             )
-            # Don't cache fail-closed HOLDs — those aren't real model output.
-            # Caching them poisons every future re-run: signals that hit the
-            # breaker during a rate-limit spike would replay as HOLD forever.
-            if not _is_fail_closed(decision):
-                cache.put(
-                    key, symbol=sig.symbol,
-                    date_str=sig.date.strftime("%Y-%m-%d"),
-                    decision=cd, provider=provider, model=model,
-                )
+            # AIDecisionCache.put refuses fail-closed decisions on its own —
+            # this call is a no-op when the advisor short-circuited (breaker,
+            # kill switch, LLM error). The wrapper still returns the HOLD to
+            # the caller so downstream backtest logic interprets the day
+            # correctly; the next re-run will re-ask against a healthy provider.
+            cache.put(
+                key, symbol=sig.symbol,
+                date_str=sig.date.strftime("%Y-%m-%d"),
+                decision=cd, provider=provider, model=model,
+            )
             return cd
 
         return _live
@@ -729,8 +716,10 @@ def main() -> None:
 
     cache = AIDecisionCache(args.cache_path)
     if args.purge_fail_closed:
-        removed = cache.purge_by_reason(list(_FAIL_CLOSED_REASON_MARKERS))
-        print(f"[backtest] purged {removed} fail-closed cache entries")
+        by_outcome = cache.purge_fail_closed()
+        by_reason = cache.purge_by_reason(list(_LEGACY_FAIL_CLOSED_REASON_MARKERS))
+        print(f"[backtest] purged {by_outcome} fail-closed cache entries "
+              f"by outcome + {by_reason} legacy entries by reason match")
 
     if args.live_ai:
         reset_advisor_circuit()

@@ -14,14 +14,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from app.services.ai_guardrails import FAIL_CLOSED_OUTCOMES, is_fail_closed
 from app.services.backtest_cache import (
     AIDecisionCache,
     CachedDecision,
     make_cache_key,
 )
 from scripts.backtest_full_stack import (
-    _FAIL_CLOSED_REASON_MARKERS,
-    _is_fail_closed,
+    _LEGACY_FAIL_CLOSED_REASON_MARKERS,
     RunResult,
     Signal,
     SyntheticBook,
@@ -209,34 +209,41 @@ class TestFullStackRunner:
 
 
 class TestFailClosedCacheProtection:
-    """When the ai_advisor short-circuits (circuit open, kill switch),
-    the returned decision is a fake HOLD, not a real model verdict.
-    Caching those poisons every re-run — signals that hit the breaker
-    during a rate-limit spike would silently replay as HOLD forever.
-    That was a real bug during a 9-symbol Groq run."""
+    """When the ai_advisor short-circuits (circuit open, kill switch, LLM
+    error), the returned decision is a fake HOLD, not a real model verdict.
+    Caching those poisons every re-run — signals that hit the breaker during
+    a rate-limit spike would silently replay as HOLD forever. That was a
+    real bug during a 9-symbol Groq run.
 
-    def test_fail_closed_detection_matches_advisor_reason_strings(self):
-        # Every reason string the real ai_advisor._hold() emits on failure.
-        # If this list drifts from ai_advisor.py, the backtest will poison
-        # its cache with fake HOLDs — as happened on a real 9-symbol run
-        # where AuthenticationError 401 got cached for 173 signals.
-        assert _is_fail_closed({"reason": "circuit breaker open — LLM unavailable"})
-        assert _is_fail_closed({"reason": "kill_switch enabled"})
-        assert _is_fail_closed({"reason": "LLM unavailable"})
-        assert _is_fail_closed({
-            "reason": "LLM llm_error: AuthenticationError: Error code: 401"
-        })
-        assert _is_fail_closed({"reason": "LLM timeout: request exceeded 15s"})
-        assert _is_fail_closed({"reason": "LLM schema_error: missing field 'action'"})
-        # Real HOLDs from the model must not trip the detector.
-        assert not _is_fail_closed({"reason": "RSI oversold but overhead resistance"})
-        # News-severity hard gate is NOT a fail-closed HOLD — it's a real
-        # deterministic decision on real news data and should be cached.
-        assert not _is_fail_closed({
-            "reason": "news severity aggregate too negative (-5.2)"
-        })
-        assert not _is_fail_closed({"reason": ""})
-        assert not _is_fail_closed({})
+    Detection is now via the structured `outcome` field on the decision
+    dict, not substring-matching `reason` — so future changes to the
+    advisor's error phrasing can't silently break this."""
+
+    def test_is_fail_closed_reads_outcome_field(self):
+        # Every outcome the advisor emits on failure.
+        assert is_fail_closed({"outcome": "kill_switch"})
+        assert is_fail_closed({"outcome": "circuit_open"})
+        assert is_fail_closed({"outcome": "llm_error"})
+        assert is_fail_closed({"outcome": "timeout"})
+        assert is_fail_closed({"outcome": "schema_error"})
+        assert is_fail_closed({"outcome": "soft_fail"})
+        # Real model verdicts and deterministic gates on real data are NOT
+        # fail-closed — they should be cached.
+        assert not is_fail_closed({"outcome": "ok"})
+        assert not is_fail_closed({"outcome": "severity_gate"})
+        # Absent or unknown outcomes are treated as real verdicts (safe
+        # default: don't drop data on a schema change).
+        assert not is_fail_closed({})
+        assert not is_fail_closed({"outcome": None})
+        assert not is_fail_closed({"outcome": "some_new_marker_we_havent_added"})
+
+    def test_advisor_fail_closed_outcomes_cover_actual_hold_reasons(self):
+        # Sanity check: the outcomes the advisor stamps on fail-closed HOLDs
+        # are the ones is_fail_closed knows about. If ai_advisor grows a new
+        # failure mode, this test drives adding it to FAIL_CLOSED_OUTCOMES.
+        expected = {"kill_switch", "circuit_open", "llm_error", "timeout",
+                    "schema_error", "soft_fail"}
+        assert expected.issubset(FAIL_CLOSED_OUTCOMES)
 
     def test_live_advisor_fail_closed_response_is_not_cached(self, in_memory_cache):
         """Simulate a live advisor that returns a circuit-open HOLD. The
@@ -247,7 +254,8 @@ class TestFailClosedCacheProtection:
             def get_model(self): return "llama-3.1"
             def decide(self, **kw):
                 return {"action": "HOLD", "confidence": 0.0,
-                        "reason": "circuit breaker open — LLM unavailable"}
+                        "reason": "circuit breaker open — LLM unavailable",
+                        "outcome": "circuit_open"}
 
         import scripts.backtest_full_stack as bfs
         # Patch the module-level import used inside make_ai_callable.
@@ -268,13 +276,30 @@ class TestFailClosedCacheProtection:
         # Wrapper still returns the fail-closed HOLD to the caller — the
         # backtest's downstream logic will interpret it correctly.
         assert cd.action == "HOLD"
+        assert cd.outcome == "circuit_open"
         # But NOTHING is in the cache — a healthy re-run would call again.
         assert in_memory_cache.stats()["count"] == 0
 
-    def test_purge_removes_fail_closed_rows_only(self, in_memory_cache):
-        """--purge-fail-closed drops the poisoned rows without touching
-        legitimate HOLDs (or BUYs) that were real model output."""
-        from app.services.backtest_cache import CachedDecision, make_cache_key
+    def test_cache_put_refuses_fail_closed_by_default(self, in_memory_cache):
+        """The cache itself is the last line of defense: even if a future
+        caller forgets to check, put() drops fail-closed decisions."""
+        key = make_cache_key(
+            symbol="AAPL", date_str="2024-06-01", proposed_action="BUY",
+            price=180.0, momentum=32.0, price_history=[180, 179, 178],
+            provider="groq", model="llama-3.1",
+        )
+        wrote = in_memory_cache.put(
+            key, symbol="AAPL", date_str="2024-06-01",
+            decision=CachedDecision("HOLD", 0.0, "boom", outcome="llm_error"),
+            provider="groq", model="llama-3.1",
+        )
+        assert wrote is False
+        assert in_memory_cache.stats()["count"] == 0
+
+    def test_purge_fail_closed_by_outcome(self, in_memory_cache):
+        """purge_fail_closed drops rows whose outcome is fail-closed —
+        primarily for cleaning up caches that were poisoned before put()
+        grew its guard, or entries written with allow_fail_closed=True."""
         good_key = make_cache_key(
             symbol="AAPL", date_str="2024-06-01", proposed_action="BUY",
             price=180.0, momentum=32.0, price_history=[180, 179, 178],
@@ -286,18 +311,44 @@ class TestFailClosedCacheProtection:
             provider="groq", model="llama-3.1",
         )
         in_memory_cache.put(good_key, symbol="AAPL", date_str="2024-06-01",
-            decision=CachedDecision("BUY", 0.75, "RSI oversold with volume confirm"),
+            decision=CachedDecision("BUY", 0.75, "RSI oversold with volume confirm",
+                                    outcome="ok"),
             provider="groq", model="llama-3.1")
+        # Force a fail-closed row in — simulates historical poisoned data.
         in_memory_cache.put(bad_key, symbol="MSFT", date_str="2024-06-01",
-            decision=CachedDecision("HOLD", 0.0, "circuit breaker open — LLM unavailable"),
-            provider="groq", model="llama-3.1")
+            decision=CachedDecision("HOLD", 0.0, "circuit breaker open — LLM unavailable",
+                                    outcome="circuit_open"),
+            provider="groq", model="llama-3.1",
+            allow_fail_closed=True)
         assert in_memory_cache.stats()["count"] == 2
 
-        removed = in_memory_cache.purge_by_reason(list(_FAIL_CLOSED_REASON_MARKERS))
+        removed = in_memory_cache.purge_fail_closed()
 
         assert removed == 1
         assert in_memory_cache.get(good_key) is not None
         assert in_memory_cache.get(bad_key) is None
+
+    def test_purge_by_reason_still_cleans_legacy_poisoned_rows(self, in_memory_cache):
+        """Legacy cache files (pre-outcome column) can only be cleaned by
+        reason substrings — the outcome column defaults to 'ok' on migration
+        so purge_fail_closed would miss them."""
+        legacy_key = make_cache_key(
+            symbol="NVDA", date_str="2024-06-01", proposed_action="BUY",
+            price=800.0, momentum=32.0, price_history=[800, 799, 798],
+            provider="groq", model="llama-3.1",
+        )
+        # A row that survived from before outcome existed — reason still
+        # tells the story, but outcome column reads as 'ok' (the migration
+        # default). purge_fail_closed can't help us here; purge_by_reason can.
+        in_memory_cache.put(legacy_key, symbol="NVDA", date_str="2024-06-01",
+            decision=CachedDecision("HOLD", 0.0, "circuit breaker open — LLM unavailable",
+                                    outcome="ok"),
+            provider="groq", model="llama-3.1")
+
+        assert in_memory_cache.purge_fail_closed() == 0  # outcome says 'ok'
+        removed = in_memory_cache.purge_by_reason(list(_LEGACY_FAIL_CLOSED_REASON_MARKERS))
+        assert removed == 1
+        assert in_memory_cache.get(legacy_key) is None
 
 
 class TestSyntheticBook:

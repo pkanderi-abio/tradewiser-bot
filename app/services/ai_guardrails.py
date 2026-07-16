@@ -21,6 +21,43 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
+# ── Decision outcomes ─────────────────────────────────────────────────────────
+#
+# Structured marker every AIAdvisor decision carries in its returned dict. The
+# advisor used to only expose `reason` (a human-readable string), which forced
+# downstream code — notably the backtest cache — to string-match on phrases
+# like "circuit breaker open" to tell "real model verdict" from "fail-closed
+# short-circuit". Two production incidents (backtest cache poisoned with 173
+# auth-error HOLDs after a rate-limit spike; auth-error string not in the
+# marker list, so every re-run replayed fake HOLDs and reported zero trades)
+# came from that coupling. `outcome` replaces it: one stable, categorical
+# field, defined here so the emitter (ai_advisor) and every consumer read the
+# same source of truth.
+#
+#   "ok"            — real LLM verdict; act on it and cache it.
+#   "severity_gate" — deterministic HOLD from real news data; still cacheable.
+#   "kill_switch"   — advisor disabled; model was not consulted.
+#   "circuit_open"  — breaker open; model was not consulted.
+#   "llm_error"     — LLM call raised (auth, network, 5xx).
+#   "timeout"       — LLM call exceeded AI_REQUEST_TIMEOUT_SECONDS.
+#   "schema_error"  — LLM returned malformed JSON / invalid schema.
+#   "soft_fail"     — LLM failed and AI_FAIL_CLOSED=False approved anyway.
+
+FAIL_CLOSED_OUTCOMES: frozenset[str] = frozenset({
+    "kill_switch", "circuit_open", "llm_error", "timeout", "schema_error", "soft_fail",
+})
+
+
+def is_fail_closed(decision: dict) -> bool:
+    """True when a decision was produced without consulting the model.
+
+    Callers that persist or act on decisions should treat these as ephemeral:
+    the backtest cache refuses to store them, and any policy layer that
+    interprets a HOLD as "the model said no" should first exclude these.
+    """
+    return decision.get("outcome") in FAIL_CLOSED_OUTCOMES
+
+
 # ── Decision schema ────────────────────────────────────────────────────────────
 
 class AIDecision(BaseModel):

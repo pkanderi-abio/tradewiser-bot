@@ -59,12 +59,19 @@ OLLAMA_MODEL = settings.OLLAMA_MODEL or "llama3.2"
 OLLAMA_URL = settings.OLLAMA_URL or "http://localhost:11434/v1"
 
 
-def _hold(symbol: str, reason: str, attempts: int = 0) -> dict:
-    """Construct a fail-closed HOLD response."""
+def _hold(symbol: str, reason: str, *, outcome: str, attempts: int = 0) -> dict:
+    """Construct a HOLD response.
+
+    `outcome` is a categorical marker (see FAIL_CLOSED_OUTCOMES in
+    ai_guardrails) that lets downstream code — the backtest cache in
+    particular — distinguish "the model wasn't consulted" from "the model
+    said HOLD". Required so no caller can silently emit an unmarked HOLD.
+    """
     return {
         "action": "HOLD",
         "confidence": 0.0,
         "reason": reason[:200],
+        "outcome": outcome,
         "_attempts": attempts,
     }
 
@@ -147,7 +154,7 @@ class AIAdvisor:
 
         # 1. Kill switch
         if settings.AI_KILL_SWITCH:
-            decision = _hold(symbol, "kill_switch enabled")
+            decision = _hold(symbol, "kill_switch enabled", outcome="kill_switch")
             self._persist(
                 symbol, proposed_action, decision,
                 prompt_hash="-", latency_ms=0, attempts=0,
@@ -166,7 +173,7 @@ class AIAdvisor:
 
         # 3. Circuit breaker
         if not self._breaker.allow():
-            decision = _hold(symbol, "circuit breaker open — LLM unavailable")
+            decision = _hold(symbol, "circuit breaker open — LLM unavailable", outcome="circuit_open")
             self._persist(
                 symbol, proposed_action, decision,
                 prompt_hash="-", latency_ms=0, attempts=0,
@@ -200,7 +207,11 @@ class AIAdvisor:
         # Hard gate for strongly negative news severity (ported experiment threshold)
         min_agg = getattr(settings, "NEWS_SEVERITY_MIN_AGGREGATE", 4.0)
         if proposed_action.upper() == "BUY" and severity_aggregate < -min_agg:
-            decision = _hold(symbol, f"news severity aggregate too negative ({severity_aggregate:.1f})")
+            decision = _hold(
+                symbol,
+                f"news severity aggregate too negative ({severity_aggregate:.1f})",
+                outcome="severity_gate",
+            )
             self._persist(
                 symbol, proposed_action, decision,
                 prompt_hash="-", latency_ms=0, attempts=0,
@@ -225,7 +236,10 @@ class AIAdvisor:
         else:
             self._breaker.record_failure()
             if settings.AI_FAIL_CLOSED:
-                decision = _hold(symbol, f"LLM {outcome}: {err or ''}".strip(), attempts)
+                decision = _hold(
+                    symbol, f"LLM {outcome}: {err or ''}".strip(),
+                    outcome=outcome, attempts=attempts,
+                )
             else:
                 # Soft-fail: approve the proposed signal at sub-threshold confidence.
                 # This is opt-in via AI_FAIL_CLOSED=false; not recommended for live.
@@ -233,6 +247,7 @@ class AIAdvisor:
                     "action": proposed_action,
                     "confidence": 0.3,
                     "reason": f"soft-fail passthrough ({outcome})",
+                    "outcome": "soft_fail",
                     "_attempts": attempts,
                 }
 
@@ -280,6 +295,8 @@ class AIAdvisor:
             "confidence": decision["confidence"],
             "reason": decision["reason"],
         }
+        if "outcome" in decision:
+            pub["outcome"] = decision["outcome"]
         if "news_severity" in decision:
             pub["news_severity"] = decision["news_severity"]
         return pub
@@ -482,6 +499,7 @@ action must be exactly BUY, SELL, or HOLD."""
                         "action": decision.action,
                         "confidence": decision.confidence,
                         "reason": decision.reason,
+                        "outcome": "ok",
                         "_attempts": attempt,
                     },
                     latency_ms,
@@ -503,7 +521,7 @@ action must be exactly BUY, SELL, or HOLD."""
 
         latency_ms = int((time.time() - start) * 1000)
         return (
-            _hold("?", f"{last_outcome}: {last_err}", attempts=max_attempts),
+            _hold("?", f"{last_outcome}: {last_err}", outcome=last_outcome, attempts=max_attempts),
             latency_ms,
             max_attempts,
             last_outcome,
@@ -640,6 +658,7 @@ action must be exactly BUY, SELL, or HOLD."""
             "action": confirmed.action,
             "confidence": confirmed.confidence,
             "reason": f"[stage2/{provider}] {confirmed.reason}"[:200],
+            "outcome": "ok",
             "_attempts": 1,
         }
         self._persist(

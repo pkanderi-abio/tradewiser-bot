@@ -21,6 +21,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Iterable, Optional
 
+from app.services.ai_guardrails import FAIL_CLOSED_OUTCOMES
+
 
 DEFAULT_CACHE_PATH = "runs/ai_decision_cache.sqlite"
 
@@ -30,6 +32,11 @@ class CachedDecision:
     action: str
     confidence: float
     reason: str
+    # "ok" for real model verdicts and deterministic gates on real data;
+    # a fail-closed marker (see ai_guardrails.FAIL_CLOSED_OUTCOMES) for
+    # HOLDs produced without consulting the model. The cache refuses to
+    # store the latter by default — see AIDecisionCache.put.
+    outcome: str = "ok"
 
 
 def make_cache_key(
@@ -80,6 +87,7 @@ class AIDecisionCache:
             action      TEXT NOT NULL,
             confidence  REAL NOT NULL,
             reason      TEXT NOT NULL,
+            outcome     TEXT NOT NULL DEFAULT 'ok',
             provider    TEXT,
             model       TEXT,
             created_at  REAL NOT NULL
@@ -97,16 +105,38 @@ class AIDecisionCache:
             path, check_same_thread=False, isolation_level=None
         )
         self._conn.executescript(self._SCHEMA)
+        self._ensure_outcome_column()
+
+    def _ensure_outcome_column(self) -> None:
+        """Backfill the outcome column on caches created before it existed.
+
+        Old rows have no way to know whether they were poisoned, so we default
+        to 'ok' — same as before this change; callers with a suspicious legacy
+        cache should still run purge_by_reason with the historical marker list.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(ai_decision_cache)"
+            ).fetchall()
+        }
+        if "outcome" not in cols:
+            self._conn.execute(
+                "ALTER TABLE ai_decision_cache ADD COLUMN outcome TEXT NOT NULL DEFAULT 'ok'"
+            )
 
     def get(self, key: str) -> Optional[CachedDecision]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT action, confidence, reason FROM ai_decision_cache WHERE cache_key = ?",
+                "SELECT action, confidence, reason, outcome FROM ai_decision_cache WHERE cache_key = ?",
                 (key,),
             ).fetchone()
         if row is None:
             return None
-        return CachedDecision(action=row[0], confidence=float(row[1]), reason=row[2])
+        return CachedDecision(
+            action=row[0], confidence=float(row[1]), reason=row[2],
+            outcome=row[3] or "ok",
+        )
 
     def put(
         self,
@@ -117,12 +147,23 @@ class AIDecisionCache:
         decision: CachedDecision,
         provider: str = "",
         model: str = "",
-    ) -> None:
+        allow_fail_closed: bool = False,
+    ) -> bool:
+        """Insert or replace a cached decision. Returns True if written.
+
+        Fail-closed decisions (outcome in FAIL_CLOSED_OUTCOMES) are silently
+        refused by default — the cache is not a place for HOLDs that mean
+        "the LLM wasn't consulted", and caching them poisons every re-run.
+        Set allow_fail_closed=True only to reconstruct legacy poisoned state
+        in tests; the runtime path should never need it.
+        """
+        if not allow_fail_closed and decision.outcome in FAIL_CLOSED_OUTCOMES:
+            return False
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO ai_decision_cache "
-                "(cache_key, symbol, date, action, confidence, reason, provider, model, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(cache_key, symbol, date, action, confidence, reason, outcome, provider, model, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     symbol.upper(),
@@ -130,11 +171,13 @@ class AIDecisionCache:
                     decision.action,
                     float(decision.confidence),
                     decision.reason,
+                    decision.outcome,
                     provider,
                     model,
                     time.time(),
                 ),
             )
+        return True
 
     def stats(self) -> dict:
         with self._lock:
@@ -147,6 +190,24 @@ class AIDecisionCache:
             "newest": row[2],
             "path": self._path,
         }
+
+    def purge_fail_closed(self) -> int:
+        """Delete any rows whose outcome is in FAIL_CLOSED_OUTCOMES.
+
+        With put()'s guard in place, new fail-closed rows can't land here at
+        all — this exists to clean up caches that already went through the
+        old string-marker era or the `allow_fail_closed=True` test path.
+        """
+        markers = list(FAIL_CLOSED_OUTCOMES)
+        if not markers:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" * len(markers))
+            cur = self._conn.execute(
+                f"DELETE FROM ai_decision_cache WHERE outcome IN ({placeholders})",
+                markers,
+            )
+            return cur.rowcount or 0
 
     def purge_by_reason(self, patterns: list[str]) -> int:
         """Delete rows whose reason matches ANY of the (case-insensitive)
