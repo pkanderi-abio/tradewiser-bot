@@ -206,6 +206,21 @@ class Settings(BaseSettings):
     SCHEDULER_MARKET_OPEN_DELAY: int = Field(300, description="Wait time after market open (seconds)")
     SCHEDULER_MARKET_CLOSE_BUFFER: int = Field(900, description="Stop trading before market close (seconds)")
 
+    # ============================================================
+    # Market-hours gate + stale-order reaper
+    # ============================================================
+    # Motivation: on 2026-07-18 (Saturday) the loop spun for hours emitting
+    # [EXIT-COOLDOWN] / [SELL-DEFERRED] on an AXP option whose SELL was queued
+    # after Friday's close and could not fill until Monday. Two knobs:
+    #   1. When the market is closed, skip the entire BUY+EXIT evaluation and
+    #      sleep MARKET_CLOSED_POLL_SECONDS instead of the 60s live cadence.
+    #   2. Auto-cancel option SELL orders older than STALE_SELL_ORDER_MAX_AGE_MINUTES
+    #      so a bad-priced limit doesn't lock a position indefinitely.
+    MARKET_HOURS_GATE_ENABLED: bool = Field(True, description="Skip trading-loop evaluation when Alpaca reports the market is closed. Set false only for extended-hours experiments (options don't trade extended anyway).")
+    MARKET_CLOSED_POLL_SECONDS: int = Field(900, description="Loop sleep interval while the market is closed (default 15 min). During market hours the loop stays at SCHEDULER_INTERVAL_SECONDS.")
+    MARKET_CLOCK_CACHE_SECONDS: int = Field(60, description="TTL on the Alpaca clock check. Prevents hammering /v2/clock every iteration.")
+    STALE_SELL_ORDER_MAX_AGE_MINUTES: int = Field(30, description="Auto-cancel unfilled option SELL orders older than this before deferring on 'existing open order' — prevents a stale limit from locking a position across sessions. 0 disables the reaper.")
+
     # Bot HTTP API key — must be set to a non-placeholder value in .env before starting
     BOT_API_KEY: str = Field("dev-key-disabled", description="API key required on X-API-Key header for bot endpoints; set a strong random value in .env")
 

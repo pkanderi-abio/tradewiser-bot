@@ -161,6 +161,72 @@ class TestExecuteSell:
         assert "AAPL" not in s.option_symbols
         assert "AAPL" not in s.entry_opt_prices
 
+    def test_defers_when_fresh_open_order_exists(self):
+        """A fresh unfilled SELL still reserves qty_available; defer instead
+        of spamming the broker with a rejection. This is the pre-existing
+        contract from commit 609fba7."""
+        s = DailyRSIStrategy()
+        s.positions["AAPL"] = 1
+        s.option_symbols["AAPL"] = "O:AAPL250117C00150000"
+
+        with patch("app.services.trading_engine.alpaca_client") as mock_alpaca:
+            mock_alpaca.has_open_order.return_value = True
+            # Reaper finds nothing stale to cancel (order is fresh).
+            mock_alpaca.cancel_stale_open_orders.return_value = 0
+
+            ok = s.execute_sell("AAPL", 155.0, reason="trailing stop")
+
+        assert ok is False
+        mock_alpaca.place_order.assert_not_called()
+        # Cooldown latched so the loop stops re-firing every tick.
+        assert "AAPL" in s.failed_exits
+
+    def test_stale_open_order_is_reaped_then_sell_proceeds(self):
+        """The 2026-07-18 AXP regression: a stale unfilled SELL locked the
+        position for hours. Now the reaper cancels it and the SELL retries."""
+        s = DailyRSIStrategy()
+        s.positions["AAPL"] = 1
+        s.option_symbols["AAPL"] = "O:AAPL250117C00150000"
+        s.entry_opt_prices["AAPL"] = 2.50
+        s.entry_stock_prices["AAPL"] = 150.0
+        s.peak_opt_prices["AAPL"] = 3.00
+
+        with patch("app.services.trading_engine.alpaca_client") as mock_alpaca:
+            # First has_open_order call: True (stale order exists).
+            # Reaper cancels 1 order.
+            # Second has_open_order call: False (cleared by the reap).
+            mock_alpaca.has_open_order.side_effect = [True, False]
+            mock_alpaca.cancel_stale_open_orders.return_value = 1
+            mock_alpaca.place_order.return_value = {"id": "ord-fresh"}
+
+            ok = s.execute_sell("AAPL", 155.0, reason="trailing stop")
+
+        assert ok is True, "SELL should succeed after the reaper clears the stale order"
+        mock_alpaca.cancel_stale_open_orders.assert_called_once()
+        mock_alpaca.place_order.assert_called_once()
+        assert "AAPL" not in s.failed_exits, "cooldown should not latch on the reap-and-retry path"
+
+    def test_reap_that_leaves_order_still_open_still_defers(self):
+        """If the reaper had nothing to reap (order was fresh) or a stale
+        order failed to cancel, has_open_order stays True and we defer as
+        before — the reaper never masks the underlying defer contract."""
+        s = DailyRSIStrategy()
+        s.positions["AAPL"] = 1
+        s.option_symbols["AAPL"] = "O:AAPL250117C00150000"
+
+        with patch("app.services.trading_engine.alpaca_client") as mock_alpaca:
+            mock_alpaca.has_open_order.return_value = True
+            # Reaper reports it cancelled something, but has_open_order still
+            # says True — could happen if a fresh order was submitted between
+            # the reap and the recheck.
+            mock_alpaca.cancel_stale_open_orders.return_value = 1
+
+            ok = s.execute_sell("AAPL", 155.0, reason="trailing stop")
+
+        assert ok is False
+        mock_alpaca.place_order.assert_not_called()
+        assert "AAPL" in s.failed_exits
+
 
 # ---------------------------------------------------------------------------
 # Constants sanity (these are critical safety values)

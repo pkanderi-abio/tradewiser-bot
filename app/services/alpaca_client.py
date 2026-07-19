@@ -1,6 +1,7 @@
 # app/services/alpaca_client.py — Alpaca Markets trading client
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 import logging
 from alpaca.trading.client import TradingClient
@@ -54,6 +55,10 @@ class AlpacaClient:
         # Captures the last broker error from place_order so callers can persist
         # the real reason instead of writing the opaque "Alpaca rejected" string.
         self.last_order_error: Optional[str] = None
+        # Small TTL cache for /v2/clock — the trading loop asks every tick and
+        # Alpaca's clock only changes at open/close boundaries.
+        # Tuple of (fetched_at_epoch, clock_dict_or_None).
+        self._clock_cache: Optional[tuple] = None
 
     def login(self) -> bool:
         """Alpaca doesn't require explicit login - authentication is via API keys"""
@@ -268,6 +273,91 @@ class AlpacaClient:
         except Exception as e:
             logger.error(f"yfinance fallback failed for {symbol}: {e}")
             return None
+
+    def market_clock(self) -> Optional[Dict[str, Any]]:
+        """Return {is_open, next_open, next_close, timestamp} or None on error.
+
+        Cached for settings.MARKET_CLOCK_CACHE_SECONDS so the trading loop
+        doesn't hit /v2/clock every 60 s. Fails open (returns None) on any
+        auth or API error — the caller should treat None as "assume open"
+        rather than halt trading, otherwise a broker outage silently stops
+        the bot the same way the May-2026 27-day auth incident did.
+        """
+        now = time.time()
+        ttl = max(0, int(settings.MARKET_CLOCK_CACHE_SECONDS))
+        if self._clock_cache and ttl:
+            fetched_at, cached = self._clock_cache
+            if now - fetched_at < ttl:
+                return cached
+        if not self._ensure_authenticated():
+            return None
+        try:
+            clock = self.trading_client.get_clock()
+        except Exception as e:
+            logger.warning(f"market_clock() failed: {e}")
+            self._clock_cache = (now, None)
+            return None
+        payload = {
+            "is_open": bool(getattr(clock, "is_open", False)),
+            "next_open": getattr(clock, "next_open", None),
+            "next_close": getattr(clock, "next_close", None),
+            "timestamp": getattr(clock, "timestamp", None),
+        }
+        self._clock_cache = (now, payload)
+        return payload
+
+    def cancel_stale_open_orders(self, symbol: str, max_age_minutes: int) -> int:
+        """Cancel any open orders for `symbol` submitted longer than
+        `max_age_minutes` ago. Returns the number successfully cancelled.
+
+        Motivation: option orders are LIMIT-only (Alpaca doesn't accept MKT for
+        options). A limit set at yesterday's mid can miss forever, and the
+        surrounding code defers new SELLs while any open order exists — so a
+        stale unfilled SELL locks the position until an operator intervenes.
+        This is the reaper: age out the stale ones so execute_sell can re-submit.
+        Never raises — a broker failure returns 0 so the caller falls through
+        to the existing defer path.
+        """
+        if max_age_minutes <= 0:
+            return 0
+        if not self._ensure_authenticated():
+            return 0
+        raw = symbol[2:] if symbol.startswith("O:") else symbol
+        try:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[raw],
+                limit=50,
+            )
+            open_orders = self.trading_client.get_orders(filter=req) or []
+        except Exception as e:
+            logger.warning(f"cancel_stale_open_orders({symbol}): list failed: {e}")
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        cancelled = 0
+        for order in open_orders:
+            submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+            if submitted is None:
+                continue
+            # Alpaca returns tz-aware datetimes; compare in UTC.
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+            if submitted > cutoff:
+                continue  # still fresh
+            try:
+                self.trading_client.cancel_order_by_id(order.id)
+                cancelled += 1
+                age_min = (datetime.now(timezone.utc) - submitted).total_seconds() / 60
+                logger.info(
+                    f"cancel_stale_open_orders({symbol}): cancelled order {order.id} "
+                    f"submitted {age_min:.1f}min ago (side={order.side.value if hasattr(order.side, 'value') else order.side})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"cancel_stale_open_orders({symbol}): failed to cancel {order.id}: {e}"
+                )
+        return cancelled
 
     def has_open_order(self, symbol: str) -> Optional[bool]:
         """Return True if any open order exists for `symbol` (with or without "O:" prefix).

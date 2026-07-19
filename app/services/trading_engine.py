@@ -323,8 +323,22 @@ class DailyRSIStrategy:
         # If a prior SELL is still open at the broker (e.g. a DAY-TIF order
         # submitted just after market close, queued for the next session),
         # qty_available is 0 and any new SELL gets rejected as "uncovered
-        # option contracts". Defer instead of spamming the broker.
+        # option contracts". Defer instead of spamming the broker — but first
+        # reap any stale unfilled SELLs. A bad-priced limit that missed by a
+        # cent will otherwise sit there indefinitely and lock the position
+        # (the 2026-07-18 AXP incident); the reaper ages them out so we can
+        # re-submit at a fresh price.
         has_open = alpaca_client.has_open_order(call_symbol)
+        if has_open is True:
+            stale_cancelled = alpaca_client.cancel_stale_open_orders(
+                call_symbol, settings.STALE_SELL_ORDER_MAX_AGE_MINUTES
+            )
+            if stale_cancelled:
+                logger.info(
+                    f"[SELL-REAPED] {call_symbol} for {symbol}: cancelled "
+                    f"{stale_cancelled} stale open order(s), retrying SELL"
+                )
+                has_open = alpaca_client.has_open_order(call_symbol)
         if has_open is True:
             logger.info(
                 f"[SELL-DEFERRED] {call_symbol} for {symbol}: existing open order "
@@ -451,9 +465,39 @@ async def start_trading_loop():
     else:
         logger.info(f"[STARTUP] Synced {synced} option position(s) from Alpaca")
 
+    # Tracks whether we've already logged the "market closed" transition so
+    # closed-market ticks stay silent instead of spamming every iteration.
+    market_open_last_seen: Optional[bool] = None
+
     while True:
         try:
             today = date.today()
+
+            # ── Market-hours gate ──────────────────────────────────────────────
+            # Skip the whole BUY+EXIT evaluation when Alpaca reports closed.
+            # Options are LIMIT-only and can't fill outside RTH anyway; the loop
+            # would otherwise spin on trailing-stop triggers with no way to act
+            # on them, spamming [EXIT-COOLDOWN] every minute (the 2026-07-18
+            # AXP incident). Log ONCE at each open/close transition. Fails
+            # open: a None clock (broker outage) is treated as "assume open"
+            # so a transient failure doesn't silently halt trading.
+            if settings.MARKET_HOURS_GATE_ENABLED:
+                clock = await asyncio.to_thread(alpaca_client.market_clock)
+                is_open = clock.get("is_open") if clock else True
+                if is_open != market_open_last_seen:
+                    if is_open:
+                        logger.info("[MARKET] Open — resuming full trading-loop evaluation")
+                    else:
+                        nxt = clock.get("next_open") if clock else None
+                        logger.info(
+                            f"[MARKET] Closed — skipping evaluation, "
+                            f"sleeping {settings.MARKET_CLOSED_POLL_SECONDS}s "
+                            f"(next open: {nxt or 'unknown'})"
+                        )
+                    market_open_last_seen = is_open
+                if not is_open:
+                    await asyncio.sleep(settings.MARKET_CLOSED_POLL_SECONDS)
+                    continue
 
             # NewsEventStrategy runs FIRST every pass. It has its own state
             # store (multi_day_positions) and its own concurrent-slot limit,

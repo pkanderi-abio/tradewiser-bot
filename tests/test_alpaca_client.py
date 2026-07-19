@@ -1,6 +1,8 @@
 """Tests for AlpacaClient (app/services/alpaca_client.py)."""
 import importlib
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -423,3 +425,192 @@ class TestGetCurrentOrders:
             result = client.get_current_orders()
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Market-hours gate + stale-order reaper — 2026-07-18 AXP-lockup regression
+# ---------------------------------------------------------------------------
+
+def _client_with_trading_mock(trading_mock=None):
+    """Build an AlpacaClient with a pre-configured TradingClient mock and
+    a successful default get_account so the client is authenticated."""
+    mock_tc_cls = MagicMock()
+    mock_tc = trading_mock or mock_tc_cls.return_value
+    if trading_mock:
+        mock_tc_cls.return_value = trading_mock
+    mock_tc.get_account.return_value = MagicMock(id="acc-123")
+
+    for mod in list(sys.modules.keys()):
+        if "alpaca_client" in mod:
+            del sys.modules[mod]
+
+    with patch("alpaca.trading.client.TradingClient", mock_tc_cls), \
+         patch("alpaca.data.historical.StockHistoricalDataClient", MagicMock()), \
+         patch("alpaca.data.historical.OptionHistoricalDataClient", MagicMock()):
+        mod = importlib.import_module("app.services.alpaca_client")
+        client = mod.AlpacaClient()
+        client.login()          # populate self.authenticated
+        client._trading_mock = mock_tc
+        return client
+
+
+class TestMarketClock:
+    """market_clock() is what the trading loop reads to skip evaluation on
+    closed sessions. It must cache (Alpaca's /v2/clock rarely changes) and
+    it must fail open — a broker outage that returns None is 'assume open',
+    not 'silently halt trading'."""
+
+    def test_returns_clock_payload_on_success(self):
+        client = _client_with_trading_mock()
+        clock = MagicMock(
+            is_open=True,
+            next_open="2026-07-20T13:30:00Z",
+            next_close="2026-07-20T20:00:00Z",
+            timestamp="2026-07-18T21:00:00Z",
+        )
+        client._trading_mock.get_clock.return_value = clock
+
+        result = client.market_clock()
+        assert result == {
+            "is_open": True,
+            "next_open": "2026-07-20T13:30:00Z",
+            "next_close": "2026-07-20T20:00:00Z",
+            "timestamp": "2026-07-18T21:00:00Z",
+        }
+
+    def test_cached_within_ttl(self, monkeypatch):
+        from app.core.config import settings
+        monkeypatch.setattr(settings, "MARKET_CLOCK_CACHE_SECONDS", 60)
+        client = _client_with_trading_mock()
+        client._trading_mock.get_clock.return_value = MagicMock(is_open=True)
+
+        for _ in range(5):
+            client.market_clock()
+
+        # 5 rapid calls, only 1 hits the broker.
+        assert client._trading_mock.get_clock.call_count == 1
+
+    def test_refetches_after_ttl(self, monkeypatch):
+        from app.core.config import settings
+        monkeypatch.setattr(settings, "MARKET_CLOCK_CACHE_SECONDS", 0)
+        client = _client_with_trading_mock()
+        client._trading_mock.get_clock.return_value = MagicMock(is_open=True)
+
+        client.market_clock()
+        client.market_clock()
+
+        # TTL=0 disables the cache — every call hits the broker.
+        assert client._trading_mock.get_clock.call_count == 2
+
+    def test_returns_none_on_broker_error_fails_open(self):
+        """Fail-open contract: broker error → None → caller assumes market is
+        open. Never silently halt trading on a clock hiccup."""
+        client = _client_with_trading_mock()
+        client._trading_mock.get_clock.side_effect = RuntimeError("500")
+
+        assert client.market_clock() is None
+
+    def test_returns_none_when_not_authenticated(self):
+        client = _client_with_trading_mock()
+        client.authenticated = False
+        client._auth_failed = True
+        client._last_auth_attempt = time.time()
+
+        assert client.market_clock() is None
+        client._trading_mock.get_clock.assert_not_called()
+
+
+class TestCancelStaleOpenOrders:
+    """The reaper. On 2026-07-18 an AXP option SELL sat queued all weekend
+    because a bad limit missed by a cent — the position was locked because
+    execute_sell defers when has_open_order is True. This method ages out
+    those stale orders so the next execute_sell can re-submit fresh."""
+
+    def _order(self, order_id, submitted_at, side="sell"):
+        m = MagicMock()
+        m.id = order_id
+        m.submitted_at = submitted_at
+        m.created_at = submitted_at
+        m.side = MagicMock(value=side)
+        return m
+
+    def test_zero_age_disables_reaper(self):
+        client = _client_with_trading_mock()
+
+        assert client.cancel_stale_open_orders("AAPL250117C00150000", 0) == 0
+        client._trading_mock.get_orders.assert_not_called()
+        client._trading_mock.cancel_order_by_id.assert_not_called()
+
+    def test_no_open_orders_returns_zero(self):
+        client = _client_with_trading_mock()
+        client._trading_mock.get_orders.return_value = []
+
+        assert client.cancel_stale_open_orders("AAPL250117C00150000", 30) == 0
+        client._trading_mock.cancel_order_by_id.assert_not_called()
+
+    def test_fresh_orders_are_not_cancelled(self):
+        client = _client_with_trading_mock()
+        now = datetime.now(timezone.utc)
+        # 5min old — well inside the 30min cutoff
+        fresh = self._order("ord-fresh", now - timedelta(minutes=5))
+        client._trading_mock.get_orders.return_value = [fresh]
+
+        assert client.cancel_stale_open_orders("AAPL250117C00150000", 30) == 0
+        client._trading_mock.cancel_order_by_id.assert_not_called()
+
+    def test_stale_orders_are_cancelled(self):
+        client = _client_with_trading_mock()
+        now = datetime.now(timezone.utc)
+        stale = self._order("ord-stale", now - timedelta(hours=48))  # weekend-old
+        fresh = self._order("ord-fresh", now - timedelta(minutes=2))
+        client._trading_mock.get_orders.return_value = [stale, fresh]
+
+        cancelled = client.cancel_stale_open_orders("AAPL250117C00150000", 30)
+        assert cancelled == 1
+        client._trading_mock.cancel_order_by_id.assert_called_once_with("ord-stale")
+
+    def test_strips_option_prefix_before_query(self):
+        client = _client_with_trading_mock()
+        client._trading_mock.get_orders.return_value = []
+
+        client.cancel_stale_open_orders("O:AAPL250117C00150000", 30)
+
+        req = client._trading_mock.get_orders.call_args.kwargs["filter"]
+        assert req.symbols == ["AAPL250117C00150000"]
+
+    def test_cancel_failure_does_not_halt_others(self):
+        """One order failing to cancel shouldn't leave the others stuck."""
+        client = _client_with_trading_mock()
+        now = datetime.now(timezone.utc)
+        stale_a = self._order("ord-a", now - timedelta(hours=48))
+        stale_b = self._order("ord-b", now - timedelta(hours=48))
+        client._trading_mock.get_orders.return_value = [stale_a, stale_b]
+        client._trading_mock.cancel_order_by_id.side_effect = [
+            RuntimeError("not found"), None,
+        ]
+
+        cancelled = client.cancel_stale_open_orders("AAPL250117C00150000", 30)
+        assert cancelled == 1  # only the second succeeded, but the first didn't abort us
+        assert client._trading_mock.cancel_order_by_id.call_count == 2
+
+    def test_list_failure_returns_zero_fails_open(self):
+        """Broker error listing orders returns 0 so execute_sell falls through
+        to the existing defer path — never blocks on a broker hiccup."""
+        client = _client_with_trading_mock()
+        client._trading_mock.get_orders.side_effect = RuntimeError("500")
+
+        assert client.cancel_stale_open_orders("AAPL250117C00150000", 30) == 0
+
+    def test_naive_datetime_is_treated_as_utc(self):
+        """Some broker responses have historically dropped tzinfo; the reaper
+        must not crash comparing tz-naive vs tz-aware datetimes."""
+        client = _client_with_trading_mock()
+        now = datetime.now(timezone.utc)
+        naive_stale = self._order(
+            "ord-naive",
+            (now - timedelta(hours=1)).replace(tzinfo=None),
+        )
+        client._trading_mock.get_orders.return_value = [naive_stale]
+
+        cancelled = client.cancel_stale_open_orders("AAPL250117C00150000", 30)
+        assert cancelled == 1
