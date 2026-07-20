@@ -1,0 +1,11 @@
+# Force LF line endings for anything that runs on Linux — even when edited
+# on Windows. A CRLF #!/bin/bash line is a shell-execution failure ("bad
+# interpreter: No such file or directory") that would only surface when the
+# script runs on the Pi.
+*.sh          text eol=lf
+*.service     text eol=lf
+*.timer       text eol=lf
+*.socket      text eol=lf
+Dockerfile    text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
