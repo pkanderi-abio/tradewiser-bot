@@ -134,6 +134,11 @@ cython_debug/
 
 # Project specific
 tradewiser_audit.db
+# SQLite write-ahead-log sidecars — created transiently whenever the bot is
+# writing to the audit DB. Not the real state, but they show as untracked in
+# `git status` and could get accidentally committed by an over-eager `git add`.
+tradewiser_audit.db-shm
+tradewiser_audit.db-wal
 *.msi
 *.cab
 *.wixpdb
