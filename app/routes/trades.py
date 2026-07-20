@@ -160,7 +160,10 @@ async def ai_status(window_minutes: int = 60, recent_limit: int = 20, tokens_win
     import time
     cached = {}
     now = time.time()
-    for sym, (ts, decision) in ai_advisor._decision_cache.items():
+    # Snapshot before iterating — the trading loop mutates _decision_cache
+    # from a background task, and iterating a live dict can raise
+    # "dictionary changed size during iteration" mid-request.
+    for sym, (ts, decision) in list(ai_advisor._decision_cache.items()):
         age = int(now - ts)
         cached[sym] = {**decision, "age_seconds": age}
     return {

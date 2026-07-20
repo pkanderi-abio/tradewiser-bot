@@ -578,6 +578,32 @@ class TestCancelStaleOpenOrders:
         req = client._trading_mock.get_orders.call_args.kwargs["filter"]
         assert req.symbols == ["AAPL250117C00150000"]
 
+    def test_query_filters_by_sell_side(self):
+        """The reaper exists to free qty_available pinned by an unfilled SELL.
+        Cancelling a stale BUY (e.g. a layered-entry order) would be surprising
+        and out of scope — filter server-side so we don't even receive them."""
+        from alpaca.trading.enums import OrderSide
+        client = _client_with_trading_mock()
+        client._trading_mock.get_orders.return_value = []
+
+        client.cancel_stale_open_orders("AAPL250117C00150000", 30)
+
+        req = client._trading_mock.get_orders.call_args.kwargs["filter"]
+        assert req.side == OrderSide.SELL
+
+    def test_never_cancels_buy_even_if_returned(self):
+        """Defense-in-depth: if the SDK filter is ever bypassed (mock, bug,
+        API change) the loop skips any non-SELL. Prevents a regression from
+        silently reaping stale BUYs."""
+        client = _client_with_trading_mock()
+        now = datetime.now(timezone.utc)
+        stale_buy = self._order("ord-buy", now - timedelta(hours=48), side="buy")
+        client._trading_mock.get_orders.return_value = [stale_buy]
+
+        cancelled = client.cancel_stale_open_orders("AAPL250117C00150000", 30)
+        assert cancelled == 0
+        client._trading_mock.cancel_order_by_id.assert_not_called()
+
     def test_cancel_failure_does_not_halt_others(self):
         """One order failing to cancel shouldn't leave the others stuck."""
         client = _client_with_trading_mock()

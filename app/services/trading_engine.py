@@ -486,17 +486,34 @@ async def start_trading_loop():
                 is_open = clock.get("is_open") if clock else True
                 if is_open != market_open_last_seen:
                     if is_open:
-                        logger.info("[MARKET] Open — resuming full trading-loop evaluation")
+                        verb = "Started" if market_open_last_seen is None else "Resumed"
+                        logger.info(f"[MARKET] Open — {verb} full trading-loop evaluation")
                     else:
                         nxt = clock.get("next_open") if clock else None
                         logger.info(
-                            f"[MARKET] Closed — skipping evaluation, "
-                            f"sleeping {settings.MARKET_CLOSED_POLL_SECONDS}s "
+                            f"[MARKET] Closed — skipping evaluation "
                             f"(next open: {nxt or 'unknown'})"
                         )
                     market_open_last_seen = is_open
                 if not is_open:
-                    await asyncio.sleep(settings.MARKET_CLOSED_POLL_SECONDS)
+                    # Sleep until the bell (capped at MARKET_CLOSED_POLL_SECONDS
+                    # so we still wake periodically if next_open is unavailable
+                    # or wrong). Without this cap-then-wake logic, a Sunday-night
+                    # loop could sleep the full 900s past 9:30 ET Monday and miss
+                    # up to 15 min of gap-open exits.
+                    poll = settings.MARKET_CLOSED_POLL_SECONDS
+                    nxt = clock.get("next_open") if clock else None
+                    if nxt is not None:
+                        try:
+                            if getattr(nxt, "tzinfo", None) is None:
+                                nxt = nxt.replace(tzinfo=timezone.utc)
+                            secs_until_open = (nxt - datetime.now(timezone.utc)).total_seconds()
+                            # Add a small buffer so we wake AFTER open, not before.
+                            # Floor at 60s to avoid a hot loop if the clock is racy.
+                            poll = min(poll, max(60, int(secs_until_open) + 5))
+                        except Exception:
+                            pass  # fall back to full poll interval
+                    await asyncio.sleep(poll)
                     continue
 
             # NewsEventStrategy runs FIRST every pass. It has its own state

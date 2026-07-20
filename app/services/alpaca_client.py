@@ -307,14 +307,20 @@ class AlpacaClient:
         return payload
 
     def cancel_stale_open_orders(self, symbol: str, max_age_minutes: int) -> int:
-        """Cancel any open orders for `symbol` submitted longer than
-        `max_age_minutes` ago. Returns the number successfully cancelled.
+        """Cancel stale open SELL orders for `symbol` and return the count.
 
-        Motivation: option orders are LIMIT-only (Alpaca doesn't accept MKT for
-        options). A limit set at yesterday's mid can miss forever, and the
-        surrounding code defers new SELLs while any open order exists — so a
+        Only SELLs are reaped. The whole point is to unlock a position whose
+        qty_available is pinned at 0 by an unfilled SELL — cancelling stale
+        BUYs wouldn't help with that, and cancelling a BUY the strategy still
+        wants to fill would be surprising (there's no layered-entry code
+        today, but this method is a plausible target for one). If you ever
+        need a BUY reaper too, make it a separate call so the intent stays
+        explicit at the call site.
+
+        Motivation: option orders are LIMIT-only (Alpaca doesn't accept MKT
+        for options). A limit set at yesterday's mid can miss forever, and
+        execute_sell defers new SELLs while any open order exists — so a
         stale unfilled SELL locks the position until an operator intervenes.
-        This is the reaper: age out the stale ones so execute_sell can re-submit.
         Never raises — a broker failure returns 0 so the caller falls through
         to the existing defer path.
         """
@@ -327,6 +333,7 @@ class AlpacaClient:
             req = GetOrdersRequest(
                 status=QueryOrderStatus.OPEN,
                 symbols=[raw],
+                side=OrderSide.SELL,
                 limit=50,
             )
             open_orders = self.trading_client.get_orders(filter=req) or []
@@ -337,6 +344,11 @@ class AlpacaClient:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
         cancelled = 0
         for order in open_orders:
+            # Defense-in-depth: the SDK filter above should already exclude
+            # non-SELLs, but confirm before touching the order.
+            side_val = order.side.value if hasattr(order.side, "value") else str(order.side)
+            if str(side_val).lower() != "sell":
+                continue
             submitted = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
             if submitted is None:
                 continue
@@ -350,8 +362,8 @@ class AlpacaClient:
                 cancelled += 1
                 age_min = (datetime.now(timezone.utc) - submitted).total_seconds() / 60
                 logger.info(
-                    f"cancel_stale_open_orders({symbol}): cancelled order {order.id} "
-                    f"submitted {age_min:.1f}min ago (side={order.side.value if hasattr(order.side, 'value') else order.side})"
+                    f"cancel_stale_open_orders({symbol}): cancelled SELL order "
+                    f"{order.id} submitted {age_min:.1f}min ago"
                 )
             except Exception as e:
                 logger.warning(
