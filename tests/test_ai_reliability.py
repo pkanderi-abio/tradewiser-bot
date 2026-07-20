@@ -25,7 +25,15 @@ from app.core.config import settings
 
 @pytest.fixture
 def fresh_advisor(monkeypatch):
-    """A new AIAdvisor instance with a sane default config and no client cached."""
+    """A new AIAdvisor instance with a sane default config and no client cached.
+
+    Ensemble is disabled here so stage-1 tests don't route through stage-2
+    unexpectedly — otherwise a valid stage-1 BUY at ~0.8 confidence falls in
+    the ENSEMBLE_CONFIRM_BAND and fires a real Anthropic/OpenAI call. In CI
+    (fake keys) that returns 401 and gets recorded as the latest audit row,
+    breaking tests that assert on stage-1 outcome. Tests that specifically
+    exercise ensemble should re-enable it locally.
+    """
     from app.services.ai_advisor import AIAdvisor
     monkeypatch.setattr(settings, "AI_KILL_SWITCH", False)
     monkeypatch.setattr(settings, "AI_FAIL_CLOSED", True)
@@ -33,6 +41,7 @@ def fresh_advisor(monkeypatch):
     monkeypatch.setattr(settings, "AI_RETRY_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(settings, "AI_CIRCUIT_BREAKER_THRESHOLD", 3)
     monkeypatch.setattr(settings, "AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS", 60)
+    monkeypatch.setattr(settings, "ENSEMBLE_ENABLED", False)
     return AIAdvisor()
 
 
