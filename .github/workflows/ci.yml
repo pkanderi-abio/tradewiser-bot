@@ -43,7 +43,13 @@ jobs:
 
     - name: Test with pytest
       env:
-        # Mock keys for tests that may hit LLM paths (they should be mocked anyway)
+        # Fake broker + LLM keys — Settings() requires ALPACA_* at import time
+        # (Field(...) with no default), so without these every test module
+        # import raises ValidationError before the tests even run. CI has no
+        # .env since edcba88 gitignored it. LLM keys are similarly required
+        # by any test that touches an advisor code path.
+        ALPACA_API_KEY: fake
+        ALPACA_SECRET_KEY: fake
         GROQ_API_KEY: fake
         OPENAI_API_KEY: fake
         ANTHROPIC_API_KEY: fake
@@ -61,6 +67,13 @@ jobs:
   # Optional: build check
   build:
     runs-on: ubuntu-latest
+    env:
+      # Same reason as the test job — Settings() needs these to import.
+      ALPACA_API_KEY: fake
+      ALPACA_SECRET_KEY: fake
+      GROQ_API_KEY: fake
+      OPENAI_API_KEY: fake
+      ANTHROPIC_API_KEY: fake
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
