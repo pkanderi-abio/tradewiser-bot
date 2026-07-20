@@ -1,0 +1,38 @@
+[Unit]
+Description=TradeWiser pull-based auto-deploy (CI-gated, self-rolling-back)
+# Wait for network + the trading service to be present before we check state.
+Wants=network-online.target
+After=network-online.target
+# Don't fight the main service during its own restart.
+After=tradewiser.service
+
+[Service]
+Type=oneshot
+User=tradewiser
+Group=tradewiser
+WorkingDirectory=/opt/tradewiser
+# Never let a stalled curl hold the timer forever.
+TimeoutStartSec=180
+# Deploy is idempotent — no-op when up-to-date — so retries on failure are safe.
+Nice=10
+ExecStart=/opt/tradewiser/scripts/pi-deploy.sh
+
+# The script needs to run `sudo systemctl restart tradewiser` — pi-cd-install.sh
+# drops a sudoers rule (/etc/sudoers.d/tradewiser-deploy) that whitelists ONLY
+# that specific command for the tradewiser user, no password required.
+# It also needs to be able to write in /opt/tradewiser (git operations).
+
+# Hardening — this unit reads/writes only what it needs.
+NoNewPrivileges=false
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tradewiser
+PrivateTmp=true
+
+# Send output to journalctl (Option 3 alerts: "just log").
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Not a normal target — driven entirely by the timer below.
+WantedBy=multi-user.target

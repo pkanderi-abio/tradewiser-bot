@@ -1,0 +1,18 @@
+[Unit]
+Description=Poll GitHub every 2 min for a new green build; deploy if there is one
+Requires=tradewiser-deploy.service
+
+[Timer]
+# First check 60s after boot so we don't race with the initial trading-loop startup.
+OnBootSec=60s
+# Then every 2 minutes. 60s API budget on GitHub's public API is 60 req/hr; we
+# use ~30/hr, comfortably under. Raise to 5m/10m if you want less log noise.
+OnUnitInactiveSec=2min
+# Add jitter so multiple Pis or manual triggers don't line up on the same tick.
+RandomizedDelaySec=15s
+# Persist across reboots so we don't miss a deploy just because the Pi cycled.
+Persistent=true
+Unit=tradewiser-deploy.service
+
+[Install]
+WantedBy=timers.target

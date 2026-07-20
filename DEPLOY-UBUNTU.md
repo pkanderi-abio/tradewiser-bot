@@ -146,6 +146,54 @@ The script handles:
 - systemd + nginx
 ## 8. Updates
 
+### Option A — Automated CI/CD (recommended, one-time setup)
+
+Push to `main` on GitHub → CI runs the tests → the Pi polls every ~2 min and
+deploys automatically once CI is green. Rolls back on health-check failure.
+
+**One-time activation, run on the Pi:**
+
+```bash
+cd /opt/tradewiser
+sudo -u tradewiser git pull
+sudo ./scripts/pi-cd-install.sh
+```
+
+What that installs:
+- `tradewiser-deploy.service` (oneshot) + `tradewiser-deploy.timer` (every 2 min)
+- `/etc/sudoers.d/tradewiser-deploy` — allows the `tradewiser` user to
+  restart *only* the `tradewiser` service (nothing else)
+- Runs one deploy pass immediately so you see whether it works
+
+Verify:
+```bash
+systemctl status tradewiser-deploy.timer      # should show "active (waiting)"
+journalctl -u tradewiser-deploy -f            # live deploy log
+systemctl start tradewiser-deploy.service     # force a deploy now
+```
+
+Behavior on failure:
+- CI red for a commit → Pi refuses to deploy it, logs why, waits for the next.
+- Health check fails after restart → Pi auto-rolls back to the previous
+  known-good commit, restarts the service, logs `ROLLED BACK to <sha>`.
+
+Optional overrides — write to `/etc/tradewiser/deploy.env` (all optional):
+```env
+REQUIRE_GREEN_CI=0          # deploy without waiting for CI (not recommended)
+HEALTH_TIMEOUT_SEC=60       # give restart more time on a slow Pi
+BRANCH=feature-x            # deploy from a branch other than main
+```
+
+Uninstall:
+```bash
+sudo systemctl disable --now tradewiser-deploy.timer
+sudo rm /etc/systemd/system/tradewiser-deploy.{service,timer}
+sudo rm /etc/sudoers.d/tradewiser-deploy
+sudo systemctl daemon-reload
+```
+
+### Option B — Manual pull (fallback)
+
 ```bash
 cd /opt/tradewiser
 sudo -u tradewiser git pull
