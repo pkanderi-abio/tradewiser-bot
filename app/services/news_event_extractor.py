@@ -90,7 +90,32 @@ def _h(headline: str) -> str:
     return hashlib.sha256(headline.encode("utf-8")).hexdigest()[:32]
 
 
-# Simple keyword-based fallback severity (cheap, no LLM). Used when circuit is open or LLM fails.
+def _soft_fail_marker(symbol: str, headline: str, h_hash: str,
+                      src: Optional[str], pub: Optional[str],
+                      outcome: str) -> "ExtractedEvent":
+    """Neutral zero-severity ExtractedEvent for the NEWS_EVENT_FAIL_CLOSED=False
+    soft-fail path. Says "we tried, the LLM was down, treat this as no signal"
+    without either (a) dropping the headline entirely or (b) inventing a
+    directional sentiment from keyword guessing (which would bias trading in
+    weird ways when the model can't be consulted)."""
+    return ExtractedEvent(
+        symbol=symbol,
+        headline=headline,
+        headline_hash=h_hash,
+        event_type="other",
+        severity=0,
+        confidence=0.0,
+        reason=f"soft-fail passthrough ({outcome})",
+        source=src,
+        published_at=pub,
+        from_cache=False,
+    )
+
+
+# Simple keyword-based fallback severity (cheap, no LLM). Kept as a public helper
+# for news_analyzer.py; NO LONGER used inside extract() — the extractor now honors
+# NEWS_EVENT_FAIL_CLOSED per its docstring (empty on failure) instead of quietly
+# inventing sentiment from keywords when the LLM is down.
 _BULLISH_KEYWORDS = {
     "beat", "exceed", "raise", "upgrade", "positive", "growth", "launch", "approval",
     "partnership", "strong", "record", "surge", "gain", "bullish", "outperform"
@@ -306,28 +331,41 @@ class NewsEventExtractor:
         if not misses:
             return cache_hits
 
-        # 5. Circuit breaker.
+        # 5. Circuit breaker. On open, honor NEWS_EVENT_FAIL_CLOSED:
+        # True (default) → drop the misses (no fake signals from keyword guessing
+        # when the model is down; NewsEventStrategy gets no entry cue for these).
+        # False (soft-fail) → emit a neutral zero-severity marker per headline so
+        # downstream aggregation sees "we tried, nothing to say". Either way we
+        # write an audit row — cache is NOT populated (never poison the cache
+        # with a fail-closed / soft-fail entry — mirrors the fix in
+        # ai_advisor._decision_cache; a healthy re-run must re-attempt the LLM).
         if not self._breaker.allow():
-            logger.warning(f"[news_event] {symbol} circuit open - using keyword fallback for {len(misses)} headlines")
-            fallback_events = []
+            if settings.NEWS_EVENT_FAIL_CLOSED:
+                logger.warning(f"[news_event] {symbol} circuit open — fail-closed, dropping {len(misses)} headlines")
+                for text, src, pub, h_hash in misses:
+                    self._persist(
+                        symbol=symbol, headline=text, h_hash=h_hash,
+                        src=src, pub=pub,
+                        event_type="other", severity=0, confidence=0.0,
+                        reason="circuit open (fail-closed)",
+                        prompt_hash="-", latency_ms=0, attempts=0,
+                        circuit=CircuitState.OPEN, outcome="circuit_open", error="circuit_open",
+                    )
+                return cache_hits
+            logger.warning(f"[news_event] {symbol} circuit open — soft-fail marker for {len(misses)} headlines")
+            soft_events = []
             for text, src, pub, h_hash in misses:
-                fb = _simple_severity_fallback(text)
-                ev = ExtractedEvent(
-                    symbol=symbol, headline=text, headline_hash=h_hash,
-                    event_type=fb["event_type"], severity=fb["severity"],
-                    confidence=fb["confidence"], reason=fb["reason"],
-                    source=src, published_at=pub, from_cache=False,
-                )
-                fallback_events.append(ev)
+                ev = _soft_fail_marker(symbol, text, h_hash, src, pub, "circuit_open")
+                soft_events.append(ev)
                 self._persist(
                     symbol=symbol, headline=text, h_hash=h_hash,
                     src=src, pub=pub,
-                    event_type=fb["event_type"], severity=fb["severity"],
-                    confidence=fb["confidence"], reason=fb["reason"],
+                    event_type=ev.event_type, severity=ev.severity,
+                    confidence=ev.confidence, reason=ev.reason,
                     prompt_hash="-", latency_ms=0, attempts=0,
-                    circuit=CircuitState.OPEN, outcome="fallback", error="circuit_open",
+                    circuit=CircuitState.OPEN, outcome="soft_fail", error="circuit_open",
                 )
-            return cache_hits + fallback_events
+            return cache_hits + soft_events
 
         # 6+7. LLM call in batches.
         fresh: List[ExtractedEvent] = []
@@ -373,25 +411,34 @@ class NewsEventExtractor:
                         prompt_tokens=ptok, completion_tokens=ctok,
                     )
                 else:
-                    # Always synthesize a keyword fallback on LLM/schema failure for this item.
-                    # This ensures NewsEventStrategy receives usable signals (instead of dropping
-                    # to zero events) even when the model returns imperfect JSON or is slow.
-                    # The attempt + error is still fully audited.
-                    fb = _simple_severity_fallback(text)
-                    fresh_ev = ExtractedEvent(
-                        symbol=symbol, headline=text, headline_hash=h_hash,
-                        event_type=fb["event_type"], severity=fb["severity"],
-                        confidence=fb["confidence"], reason=fb["reason"] + " (fallback)",
-                        source=src, published_at=pub, from_cache=False,
-                    )
+                    # LLM/schema/timeout failure on this item. Honor
+                    # NEWS_EVENT_FAIL_CLOSED — either drop the item entirely
+                    # (True; the default and safest for live trading) or emit
+                    # a neutral zero-severity soft-fail marker (False; useful
+                    # for backtests where losing a headline is worse than an
+                    # honest "no signal"). Audit is written either way so
+                    # ops can see the LLM failure rate. Cache is NOT populated:
+                    # a healthy re-run must re-attempt the LLM (same lesson as
+                    # ai_advisor._decision_cache 2b9783f — never cache a
+                    # decision the model didn't produce).
+                    if settings.NEWS_EVENT_FAIL_CLOSED:
+                        self._persist(
+                            symbol=symbol, headline=text, h_hash=h_hash, src=src, pub=pub,
+                            event_type="other", severity=0, confidence=0.0,
+                            reason=f"LLM {outcome} (fail-closed): {(err or '')[:80]}",
+                            prompt_hash=prompt_hash, latency_ms=latency_ms, attempts=attempts,
+                            circuit=self._breaker.state(), outcome=outcome, error=err,
+                            prompt_tokens=ptok, completion_tokens=ctok,
+                        )
+                        continue
+                    fresh_ev = _soft_fail_marker(symbol, text, h_hash, src, pub, outcome)
                     fresh.append(fresh_ev)
-                    self._cache[h_hash] = (now + ttl, fresh_ev)
                     self._persist(
                         symbol=symbol, headline=text, h_hash=h_hash, src=src, pub=pub,
-                        event_type=fb["event_type"], severity=fb["severity"],
-                        confidence=fb["confidence"], reason=fb["reason"] + " (after LLM fail)",
+                        event_type=fresh_ev.event_type, severity=fresh_ev.severity,
+                        confidence=fresh_ev.confidence, reason=fresh_ev.reason,
                         prompt_hash=prompt_hash, latency_ms=latency_ms, attempts=attempts,
-                        circuit=self._breaker.state(), outcome=outcome, error=err,
+                        circuit=self._breaker.state(), outcome="soft_fail", error=err,
                         prompt_tokens=ptok, completion_tokens=ctok,
                     )
 
@@ -596,15 +643,22 @@ Example format:
                     last_outcome = "schema_error"
                     break
 
-                # Accept partial results: if the model gave us at least one valid event, treat as usable.
-                # This greatly improves success rate vs requiring *exact* count.
-                if len(events) > 0:
+                # Require exact count. A partial return means the model
+                # silently skipped headlines, and downstream code (persist +
+                # NewsEventStrategy) has no way to tell which ones — pairing
+                # events to headlines positionally would be a lie. Treat as a
+                # batch-level schema error; the fail-closed path in extract()
+                # then decides whether to drop or emit soft-fail markers per
+                # NEWS_EVENT_FAIL_CLOSED. (Previously accepted any partial
+                # result, which contradicted the fail-closed contract in
+                # this module's docstring and let the model quietly deliver
+                # 1-of-N without the caller knowing.)
+                if len(events) == expected_count:
                     latency_ms = int((time.time() - start) * 1000)
                     return events, latency_ms, attempt, "ok", None, ptok, ctok
-                else:
-                    last_err = "no valid events after validation"
-                    last_outcome = "schema_error"
-                    break
+                last_err = f"got {len(events)} valid events, expected {expected_count}"
+                last_outcome = "schema_error"
+                break
 
             except Exception as e:
                 last_err = f"{type(e).__name__}: {str(e)[:120]}"
