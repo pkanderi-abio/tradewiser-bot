@@ -264,17 +264,29 @@ Key trading parameters (defaults in `config.py`):
 
 ## Trading strategy parameters
 
-Defined as constants in `app/services/trading_engine.py`:
+Constants live in `app/services/trading_engine.py` but most read through
+`getattr(settings, "SHORT_TERM_*", default)`, so anything in the `SHORT_TERM_*`
+column below can be overridden per-deploy in `.env`. The value shown is the
+CODE DEFAULT — what runs on a fresh install with no override.
 
-| Parameter | Value | Meaning |
-|---|---|---|
-| `RSI_BUY_THRESHOLD` | 35 | Buy when RSI < 35 (oversold) |
-| `RSI_SELL_THRESHOLD` | 70 | Sell when RSI > 70 (overbought) |
-| `PROFIT_TARGET` | 0.60 | Exit option at +60% gain |
-| `STOP_LOSS` | 0.30 | Exit option at -30% loss |
-| `MAX_POSITIONS` | 5 | Max concurrent option trades |
-| `IV_RANK_MAX` | 50 | Skip if HV rank > 50% |
-| `EARNINGS_DAYS_MIN` | 7 | Skip if earnings within 7 days |
-| `TRAILING_STOP_ACTIVATION` | 0.20 | Arm trailing stop at +20% |
-| `OPTION_WEEKS_OUT` | 4 | Buy ~4-week expiry options |
-| `DAYS_BEFORE_EXPIRY` | 3 | Close 3 days before expiry |
+| Constant | Default | `.env` override | Meaning |
+|---|---|---|---|
+| `RSI_BUY_THRESHOLD` | 35 | `SHORT_TERM_RSI_BUY_THRESHOLD` | Buy when RSI < 35 (oversold) |
+| `RSI_SELL_THRESHOLD` | 70 | `SHORT_TERM_RSI_SELL_THRESHOLD` | Sell when RSI > 70 (overbought) |
+| `PROFIT_TARGET` | 0.50 | `SHORT_TERM_PROFIT_TARGET` | Exit option at +50% gain |
+| `STOP_LOSS` | 0.30 | `SHORT_TERM_STOP_LOSS` | Exit option at -30% loss |
+| `MAX_POSITIONS` | 5 | `SHORT_TERM_MAX_POSITIONS` | Max concurrent option trades |
+| `IV_RANK_MAX` | 50 | `SHORT_TERM_IV_RANK_MAX` | Skip if HV rank > 50% |
+| `EARNINGS_DAYS_MIN` | 7 | `SHORT_TERM_EARNINGS_BUFFER_DAYS` | Skip if earnings within 7 days |
+| `TRAILING_STOP_ACTIVATION` | 0.20 | `SHORT_TERM_TRAILING_ACTIVATION` | Arm trailing stop at +20% |
+| `TRAILING_STOP_PCT` | 0.15 | `SHORT_TERM_TRAILING_STOP_PCT` | Trailing stop = peak × (1 - 0.15) once armed |
+| `OPTION_WEEKS_OUT` | 2 | `SHORT_TERM_OPTION_WEEKS_OUT` | Buy ~2-week expiry ATM calls |
+| `DAYS_BEFORE_EXPIRY` | 3 | *(not overridable)* | Close 3 days before expiry |
+
+> **Note:** earlier revisions of this doc listed `PROFIT_TARGET=0.60` and
+> `OPTION_WEEKS_OUT=4`. Those were the values before the strategy was
+> retuned for shorter-duration + tighter-target trades (commit history:
+> the `getattr(..., SHORT_TERM_*)` shim was added later than the doc's
+> original table). If you want the old profile back, set
+> `SHORT_TERM_OPTION_WEEKS_OUT=4` and `SHORT_TERM_PROFIT_TARGET=0.60`
+> in `.env` — no code change needed.
